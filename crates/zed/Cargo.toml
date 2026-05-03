@@ -119,6 +119,7 @@ go_to_line.workspace = true
 system_specs.workspace = true
 gpui = { workspace = true, features = ["input-latency-histogram"] }
 gpui_platform = {workspace = true, features=["screen-capture", "font-kit", "wayland", "x11"]}
+graph_lens = { path = "../graph_lens" }
 image = { workspace = true, optional = true }
 semver.workspace = true
 tempfile = { workspace = true, optional = true }

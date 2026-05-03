@@ -747,6 +747,8 @@ fn main() {
         #[cfg(target_os = "windows")]
         etw_tracing::init(cx);
 
+        graph_lens::init(cx);
+
         cx.observe_global::<SettingsStore>({
             let http = app_state.client.http_client();
             let client = app_state.client.clone();

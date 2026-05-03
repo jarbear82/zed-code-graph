@@ -1,0 +1,9 @@
+[package]
+name = "graph_lens"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gpui = { path = "../gpui" }
+ui = { path = "../ui" }
+workspace = { path = "../workspace" }
