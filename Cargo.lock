@@ -7967,6 +7967,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph_lens"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "project",
+ "rustix 0.38.44",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "grid"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22425,6 +22436,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "gpui_tokio",
+ "graph_lens",
  "http_client",
  "image",
  "image_viewer",

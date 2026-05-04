@@ -7,3 +7,5 @@ edition = "2021"
 gpui = { path = "../gpui" }
 ui = { path = "../ui" }
 workspace = { path = "../workspace" }
+project = { path = "../project" }
+rustix = "0.38"
