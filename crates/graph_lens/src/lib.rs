@@ -4,6 +4,7 @@ use gpui::{
     ScrollWheelEvent, Window, actions, prelude::*, px,
 };
 use project::{Project, ProjectEntryId, WorktreeId};
+use std::collections::HashSet;
 use ui::{Color, IconName, Label, LabelSize, prelude::*};
 use workspace::{
     Workspace,
@@ -29,7 +30,7 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-// ─── Layout constants ──
+// ─── Constants ───
 
 const NODE_W: f32 = 200.0;
 const HEADER_H: f32 = 30.0;
@@ -39,8 +40,6 @@ const INNER_PAD: f32 = 14.0;
 const CHILD_GAP: f32 = 10.0;
 const ROOT_GAP: f32 = 24.0;
 
-// ─── Viewport constants ──
-
 const DEFAULT_PAN: Point<f32> = Point::new(20.0, 20.0);
 const DEFAULT_ZOOM: f32 = 1.0;
 const ZOOM_MIN: f32 = 0.1;
@@ -48,18 +47,50 @@ const ZOOM_MAX: f32 = 5.0;
 const ZOOM_CLICK_STEP: f32 = 0.1;
 const ZOOM_SCROLL_SENSITIVITY: f32 = 0.002;
 
-// ─── Canvas constants ──
-
 const ROOT_PAD_X: f32 = 60.0;
 const ROOT_PAD_Y: f32 = 60.0;
-
-// ─── UI constants ──
 
 const HEADER_PAD: f32 = 8.0;
 const HEADER_GAP: f32 = 6.0;
 const ATTR_PAD: f32 = 14.0;
 
-// ─── Viewport struct ──
+// ─── Layout config ───
+
+struct LayoutConfig {
+    node_width: f32,
+    header_height: f32,
+    attr_height: f32,
+    attr_bottom_pad: f32,
+    inner_pad: f32,
+    child_gap: f32,
+    root_gap: f32,
+    root_pad_x: f32,
+    root_pad_y: f32,
+    header_pad: f32,
+    header_gap: f32,
+    attr_pad: f32,
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            node_width: NODE_W,
+            header_height: HEADER_H,
+            attr_height: ATTR_H,
+            attr_bottom_pad: ATTR_BOTTOM_PAD,
+            inner_pad: INNER_PAD,
+            child_gap: CHILD_GAP,
+            root_gap: ROOT_GAP,
+            root_pad_x: ROOT_PAD_X,
+            root_pad_y: ROOT_PAD_Y,
+            header_pad: HEADER_PAD,
+            header_gap: HEADER_GAP,
+            attr_pad: ATTR_PAD,
+        }
+    }
+}
+
+// ─── Viewport ───
 
 pub struct Viewport {
     pub pan: Point<f32>,
@@ -75,7 +106,7 @@ impl Default for Viewport {
     }
 }
 
-// ─── Data model ──────────────────────────────────────────────────────
+// ─── Data model ───
 
 pub struct GraphNode {
     pub name: String,
@@ -91,55 +122,57 @@ pub struct GraphNode {
 }
 
 /// Compute world-space position and size for `node` and all descendants.
-fn layout_node(node: &mut GraphNode, pos: Point<f32>) {
+fn layout_node(node: &mut GraphNode, pos: Point<f32>, config: &LayoutConfig) {
     node.world_position = pos;
 
     if !node.is_dir {
-        node.world_size = Point::new(NODE_W, HEADER_H);
+        node.world_size = Point::new(config.node_width, config.header_height);
         return;
     }
 
     if !node.is_expanded {
         let rows = node.children.len() as f32;
-        let h = HEADER_H
+        let h = config.header_height
             + if rows > 0.0 {
-                rows * ATTR_H + ATTR_BOTTOM_PAD
+                rows * config.attr_height + config.attr_bottom_pad
             } else {
                 0.0
             };
-        node.world_size = Point::new(NODE_W, h);
+        node.world_size = Point::new(config.node_width, h);
         return;
     }
 
-    let child_x = pos.x + INNER_PAD;
-    let mut child_y = pos.y + HEADER_H + INNER_PAD;
+    let child_x = pos.x + config.inner_pad;
+    let mut child_y = pos.y + config.header_height + config.inner_pad;
     let mut max_child_w: f32 = 0.0;
 
     for child in &mut node.children {
-        layout_node(child, Point::new(child_x, child_y));
-        child_y += child.world_size.y + CHILD_GAP;
+        layout_node(child, Point::new(child_x, child_y), config);
+        child_y += child.world_size.y + config.child_gap;
         max_child_w = max_child_w.max(child.world_size.x);
     }
 
     let total_h = if node.children.is_empty() {
-        HEADER_H + INNER_PAD * 2.0
+        config.header_height + config.inner_pad * 2.0
     } else {
-        (child_y - CHILD_GAP + INNER_PAD) - pos.y
+        (child_y - config.child_gap + config.inner_pad) - pos.y
     };
-    let total_w = (max_child_w + INNER_PAD * 2.0).max(NODE_W);
+    let total_w = (max_child_w + config.inner_pad * 2.0).max(config.node_width);
 
     node.world_size = Point::new(total_w, total_h);
 }
 
-// ─── Panel ───────────────────────────────────────────────────────────
+// ─── Panel ───
 
 pub struct GraphLensPanel {
     project: Entity<Project>,
     focus_handle: FocusHandle,
     viewport: Viewport,
     nodes: Vec<GraphNode>,
+    expanded_set: HashSet<ProjectEntryId>,
     last_mouse_pos: Option<Point<f32>>,
     is_panning: bool,
+    config: LayoutConfig,
 }
 
 impl GraphLensPanel {
@@ -164,8 +197,10 @@ impl GraphLensPanel {
             focus_handle: cx.focus_handle(),
             viewport: Viewport::default(),
             nodes: Vec::new(),
+            expanded_set: HashSet::new(),
             last_mouse_pos: None,
             is_panning: false,
+            config: LayoutConfig::default(),
         };
         this.update_nodes(cx);
         this
@@ -175,6 +210,15 @@ impl GraphLensPanel {
         let mut new_nodes = Vec::new();
         let project = self.project.read(cx);
 
+        // Collect all expanded entry IDs for O(1) lookup.
+        let mut expanded_set = HashSet::new();
+        for node in &self.nodes {
+            if node.is_expanded {
+                expanded_set.insert(node.entry_id);
+            }
+        }
+        self.expanded_set = expanded_set;
+
         for worktree in project.worktrees(cx) {
             let worktree = worktree.read(cx);
             if let Some(root) = worktree.root_entry() {
@@ -183,6 +227,7 @@ impl GraphLensPanel {
                     .iter()
                     .find(|n| n.entry_id == root.id)
                     .map(|n| n.is_expanded)
+                    .or_else(|| self.expanded_set.contains(&root.id).then(|| true))
                     .unwrap_or(true);
 
                 let mut node = GraphNode {
@@ -200,7 +245,7 @@ impl GraphLensPanel {
                     children: Vec::new(),
                 };
 
-                self.populate_children(&mut node, &worktree);
+                self.populate_tree(&mut node, &worktree);
                 new_nodes.push(node);
             }
         }
@@ -214,7 +259,7 @@ impl GraphLensPanel {
     ///
     /// Expanded child dirs recurse fully. Collapsed child dirs populate
     /// their immediate children so the attribute list is never empty.
-    fn populate_children(&self, node: &mut GraphNode, worktree: &project::Worktree) {
+    fn populate_tree(&self, node: &mut GraphNode, worktree: &project::Worktree) {
         if !node.is_dir {
             return;
         }
@@ -222,9 +267,7 @@ impl GraphLensPanel {
             return;
         };
         for child_entry in worktree.child_entries(&entry.path) {
-            let is_expanded = self
-                .find_old_expanded_state(child_entry.id)
-                .unwrap_or(false);
+            let is_expanded = self.expanded_set.contains(&child_entry.id);
 
             let mut child = GraphNode {
                 name: child_entry
@@ -241,69 +284,25 @@ impl GraphLensPanel {
                 children: Vec::new(),
             };
 
-            if child.is_dir {
-                if is_expanded {
-                    self.populate_children(&mut child, worktree);
-                } else {
-                    self.populate_immediate_children(&mut child, worktree);
-                }
+            if child.is_dir && is_expanded {
+                self.populate_tree(&mut child, worktree);
             }
 
             node.children.push(child);
         }
     }
 
-    fn populate_immediate_children(&self, node: &mut GraphNode, worktree: &project::Worktree) {
-        let Some(entry) = worktree.entry_for_id(node.entry_id) else {
-            return;
-        };
-        for child_entry in worktree.child_entries(&entry.path) {
-            let is_expanded = self
-                .find_old_expanded_state(child_entry.id)
-                .unwrap_or(false);
-            node.children.push(GraphNode {
-                name: child_entry
-                    .path
-                    .file_name()
-                    .map(|n| n.to_string())
-                    .unwrap_or_default(),
-                worktree_id: worktree.id(),
-                entry_id: child_entry.id,
-                is_dir: child_entry.is_dir(),
-                is_expanded,
-                world_position: Point::default(),
-                world_size: Point::default(),
-                children: Vec::new(),
-            });
-        }
-    }
-
-    fn find_old_expanded_state(&self, id: ProjectEntryId) -> Option<bool> {
-        fn search(nodes: &[GraphNode], id: ProjectEntryId) -> Option<bool> {
-            for n in nodes {
-                if n.entry_id == id {
-                    return Some(n.is_expanded);
-                }
-                if let Some(s) = search(&n.children, id) {
-                    return Some(s);
-                }
-            }
-            None
-        }
-        search(&self.nodes, id)
-    }
-
     fn layout(&mut self) {
         let mut nodes = std::mem::take(&mut self.nodes);
-        let mut y = ROOT_PAD_Y;
+        let mut y = self.config.root_pad_y;
         for node in &mut nodes {
-            layout_node(node, Point::new(ROOT_PAD_X, y));
-            y += node.world_size.y + ROOT_GAP;
+            layout_node(node, Point::new(self.config.root_pad_x, y), &self.config);
+            y += node.world_size.y + self.config.root_gap;
         }
         self.nodes = nodes;
     }
 
-    // ── Input handlers ─────────────────────────────────────────────
+    // ── Input handlers ───
 
     fn on_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
         let dy = event.delta.pixel_delta(px(1.0)).y.as_f32();
@@ -352,7 +351,7 @@ impl GraphLensPanel {
         }
     }
 
-    // ── Coordinate helper ──────────────────────────────────────────
+    // ── Coordinate helper ──
 
     fn w2s(&self, world: Point<f32>) -> Point<Pixels> {
         Point::new(
@@ -361,7 +360,39 @@ impl GraphLensPanel {
         )
     }
 
-    // ── Render helpers ─────────────────────────────────────────────
+    /// Render the children list of a collapsed directory node.
+    fn render_children_list<'a>(
+        &self,
+        children: &'a [GraphNode],
+        cx: &Context<Self>,
+    ) -> impl IntoElement + 'a {
+        let z = self.viewport.zoom;
+        let mut card = div().flex().flex_col();
+        for child in children {
+            let child_prefix = type_prefix(child.is_dir);
+            card = card.child(
+                div()
+                    .h(px(self.config.attr_height * z))
+                    .px(px(self.config.attr_pad * z))
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        Label::new(format!("{child_prefix} : {}", child.name))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            );
+        }
+        if !children.is_empty() {
+            card = card.child(div().h(px(self.config.attr_bottom_pad * z)).flex_shrink_0());
+        }
+        card
+    }
+
+    // ── Render helpers ───
 
     /// Toolbar: title + zoom controls. Lives above the canvas div so
     /// toolbar clicks never start a canvas pan.
@@ -370,7 +401,6 @@ impl GraphLensPanel {
         let zoom_pct = (self.viewport.zoom * 100.0).round() as u32;
         let bg = cx.theme().colors().element_background;
         let border = cx.theme().colors().border;
-        let _zoom = self.viewport.zoom;
         let label_size = LabelSize::XSmall;
 
         let btn = |label: &'static str| {
@@ -407,7 +437,8 @@ impl GraphLensPanel {
             .child(div().w(px(1.0)).h_4().mx_1().bg(border))
             .child(btn("−").on_mouse_down(MouseButton::Left, {
                 let view = view.clone();
-                move |_, _window, cx| {
+                move |_event, _window, cx| {
+                    cx.stop_propagation();
                     view.update(cx, |this, cx| {
                         this.viewport.zoom = (this.viewport.zoom - ZOOM_CLICK_STEP).max(ZOOM_MIN);
                         cx.notify();
@@ -423,7 +454,8 @@ impl GraphLensPanel {
             )
             .child(btn("+").on_mouse_down(MouseButton::Left, {
                 let view = view.clone();
-                move |_, _window, cx| {
+                move |_event, _window, cx| {
+                    cx.stop_propagation();
                     view.update(cx, |this, cx| {
                         this.viewport.zoom = (this.viewport.zoom + ZOOM_CLICK_STEP).min(ZOOM_MAX);
                         cx.notify();
@@ -433,7 +465,8 @@ impl GraphLensPanel {
             .child(div().w(px(1.0)).h_4().mx_1().bg(border))
             .child(btn("Reset").on_mouse_down(MouseButton::Left, {
                 let view = view.clone();
-                move |_, _window, cx| {
+                move |_event, _window, cx| {
+                    cx.stop_propagation();
                     view.update(cx, |this, cx| {
                         this.viewport = Viewport::default();
                         cx.notify();
@@ -466,18 +499,19 @@ impl GraphLensPanel {
             .flex_col()
             .child(
                 div()
-                    .h(px(HEADER_H * z))
-                    .px(px(HEADER_PAD * z))
+                    .h(px(self.config.header_height * z))
+                    .px(px(self.config.header_pad * z))
                     .flex()
                     .flex_shrink_0()
                     .items_center()
-                    .gap(px(HEADER_GAP * z))
+                    .gap(px(self.config.header_gap * z))
                     .bg(cx.theme().colors().element_background)
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
+                        cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
                             this.toggle_expanded(entry_id, cx);
                         }),
                     )
@@ -496,23 +530,24 @@ impl GraphLensPanel {
         let is_dir = node.is_dir;
         let label_size = LabelSize::XSmall;
 
-        let type_prefix = if is_dir { "Dir." } else { "File" };
+        let type_prefix = type_prefix(is_dir);
         let expand_icon = if is_dir { "▶" } else { "  " };
 
         let header = div()
-            .h(px(HEADER_H * z))
-            .px(px(HEADER_PAD * z))
+            .h(px(self.config.header_height * z))
+            .px(px(self.config.header_pad * z))
             .flex()
             .flex_shrink_0()
             .items_center()
-            .gap(px(HEADER_GAP * z))
+            .gap(px(self.config.header_gap * z))
             .bg(cx.theme().colors().element_background)
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .when(is_dir, |el| {
                 el.on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
+                    cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
                         this.toggle_expanded(entry_id, cx);
                     }),
                 )
@@ -534,36 +569,33 @@ impl GraphLensPanel {
             .child(header);
 
         if is_dir && !node.is_expanded {
-            for child in &node.children {
-                let child_prefix = if child.is_dir { "Dir." } else { "File" };
-                card = card.child(
-                    div()
-                        .h(px(ATTR_H * z))
-                        .px(px(ATTR_PAD * z))
-                        .flex()
-                        .flex_shrink_0()
-                        .items_center()
-                        .border_b_1()
-                        .border_color(cx.theme().colors().border)
-                        .child(
-                            Label::new(format!("{child_prefix} : {}", child.name))
-                                .size(label_size)
-                                .color(Color::Muted),
-                        ),
-                );
-            }
-            if !node.children.is_empty() {
-                card = card.child(div().h(px(ATTR_BOTTOM_PAD * z)).flex_shrink_0());
+            card = card.child(self.render_children_list(&node.children, cx));
+        }
+        card.into_any_element()
+    }
+
+    /// Collect expanded dirs and leaf nodes into separate lists for z-order rendering.
+    fn collect_nodes<'a>(
+        nodes: &'a [GraphNode],
+        expanded: &mut Vec<&'a GraphNode>,
+        leaves: &mut Vec<&'a GraphNode>,
+    ) {
+        for n in nodes {
+            if n.is_dir && n.is_expanded {
+                expanded.push(n);
+                Self::collect_nodes(&n.children, expanded, leaves);
+            } else {
+                leaves.push(n);
             }
         }
-
-        card.into_any_element()
     }
 }
 
-// ─── GPUI trait impls ────────────────────────────────────────────────
+fn type_prefix(is_dir: bool) -> &'static str {
+    if is_dir { "Dir." } else { "File" }
+}
 
-impl EventEmitter<PanelEvent> for GraphLensPanel {}
+// ─── GPUI trait impls ───
 
 impl Focusable for GraphLensPanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -579,21 +611,7 @@ impl Render for GraphLensPanel {
         let mut expanded: Vec<&GraphNode> = Vec::new();
         let mut leaves: Vec<&GraphNode> = Vec::new();
 
-        fn collect<'a>(
-            nodes: &'a [GraphNode],
-            expanded: &mut Vec<&'a GraphNode>,
-            leaves: &mut Vec<&'a GraphNode>,
-        ) {
-            for n in nodes {
-                if n.is_dir && n.is_expanded {
-                    expanded.push(n);
-                    collect(&n.children, expanded, leaves);
-                } else {
-                    leaves.push(n);
-                }
-            }
-        }
-        collect(&self.nodes, &mut expanded, &mut leaves);
+        Self::collect_nodes(&self.nodes, &mut expanded, &mut leaves);
 
         let toolbar = self.render_toolbar(cx);
 
@@ -648,6 +666,8 @@ impl Render for GraphLensPanel {
             )
     }
 }
+
+impl EventEmitter<PanelEvent> for GraphLensPanel {}
 
 impl Panel for GraphLensPanel {
     fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
