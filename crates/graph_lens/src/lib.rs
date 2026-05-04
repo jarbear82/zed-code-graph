@@ -3,14 +3,14 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
     ScrollWheelEvent, Window, actions, canvas, prelude::*, px,
 };
-use project::Project;
+use project::{Project, ProjectEntryId, WorktreeId};
 use ui::{IconName, Label, prelude::*};
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
 
-// Define an action to let users toggle your panel via the command palette or keybinds
+// Define an action to let users toggle the panel via the command palette or keybinds
 actions!(graph_lens, [ToggleFocus]);
 
 pub fn init(cx: &mut App) {
@@ -24,7 +24,7 @@ pub fn init(cx: &mut App) {
             let project = workspace.project().clone();
 
             // 1. Create the panel entity
-            let panel = cx.new(|cx| GraphLensPanel::new(project, cx));
+            let panel = cx.new(|cx| GraphLensPanel::new(project, window, cx));
 
             // 2. Add it to the workspace (this is what tells the Dock to render the icon!)
             workspace.add_panel(panel, window, cx);
@@ -43,7 +43,7 @@ pub fn init(cx: &mut App) {
 /// Represents the camera looking at the infinite canvas
 pub struct Viewport {
     pub pan: Point<f32>,
-    pub zoom: f32, // e.g., 1.0 is 100% scale
+    pub zoom: f32, // 1.0 is 100% scale
 }
 
 impl Default for Viewport {
@@ -58,6 +58,8 @@ impl Default for Viewport {
 /// A structured representation of the filesystem
 pub struct GraphNode {
     pub name: String,
+    pub worktree_id: WorktreeId,
+    pub entry_id: ProjectEntryId,
     pub is_dir: bool,
     pub is_expanded: bool,
     pub world_position: Point<f32>, // Absolute position in the infinite grid
@@ -65,7 +67,7 @@ pub struct GraphNode {
 }
 
 pub struct GraphLensPanel {
-    _project: Entity<Project>,
+    project: Entity<Project>,
     focus_handle: FocusHandle,
     viewport: Viewport,
     nodes: Vec<GraphNode>,
@@ -74,58 +76,127 @@ pub struct GraphLensPanel {
 }
 
 impl GraphLensPanel {
-    pub fn new(project: Entity<Project>, cx: &mut Context<Self>) -> Self {
-        let mut nodes = Vec::new();
+    pub fn new(project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        cx.subscribe_in(
+            &project,
+            window,
+            |this, _, event, _window, cx| match event {
+                project::Event::WorktreeUpdatedEntries(_, _)
+                | project::Event::WorktreeAdded(_)
+                | project::Event::WorktreeRemoved(_)
+                | project::Event::WorktreeOrderChanged => {
+                    this.update_nodes(cx);
+                }
+                _ => {}
+            },
+        )
+        .detach();
 
-        let project_handle = project.read(cx);
+        let mut this = Self {
+            project,
+            focus_handle: cx.focus_handle(),
+            viewport: Viewport::default(),
+            nodes: Vec::new(),
+            last_mouse_position: None,
+            is_panning: false,
+        };
+        this.update_nodes(cx);
+        this
+    }
+
+    fn update_nodes(&mut self, cx: &mut Context<Self>) {
+        let mut new_nodes = Vec::new();
+
+        let project_handle = self.project.read(cx);
         let x = 100.0;
         let mut y = 100.0;
 
         for worktree in project_handle.worktrees(cx) {
             let worktree = worktree.read(cx);
-            for entry in worktree.entries(false, 0) {
-                if entry.path.is_empty() {
-                    let mut node = GraphNode {
-                        name: entry.path.as_unix_str().to_string(),
-                        is_dir: entry.is_dir(),
-                        is_expanded: false,
-                        world_position: Point::new(x, y),
-                        children: Vec::new(),
-                    };
+            if let Some(root_entry) = worktree.root_entry() {
+                let is_expanded = self
+                    .nodes
+                    .iter()
+                    .find(|n| n.entry_id == root_entry.id)
+                    .map(|n| n.is_expanded)
+                    .unwrap_or(true); // Root is expanded by default
 
-                    // Basic recursive population for the first level
-                    if entry.is_dir() {
-                        for child_entry in worktree.child_entries(&entry.path) {
-                            node.children.push(GraphNode {
-                                name: child_entry
-                                    .path
-                                    .file_name()
-                                    .map(|n| n.to_string())
-                                    .unwrap_or_default(),
-                                is_dir: child_entry.is_dir(),
-                                is_expanded: false,
-                                world_position: Point::new(x + 200.0, y), // Just a placeholder
-                                children: Vec::new(),
-                            });
-                        }
-                    }
+                let mut node = GraphNode {
+                    name: worktree
+                        .abs_path()
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Root".to_string()),
+                    worktree_id: worktree.id(),
+                    entry_id: root_entry.id,
+                    is_dir: root_entry.is_dir(),
+                    is_expanded,
+                    world_position: Point::new(x, y),
+                    children: Vec::new(),
+                };
 
-                    nodes.push(node);
-                    y += 200.0;
-                }
+                self.populate_children(&mut node, &worktree);
+
+                new_nodes.push(node);
+                y += 200.0; // This will be fixed by layout()
             }
         }
 
-        let mut this = Self {
-            _project: project,
-            focus_handle: cx.focus_handle(),
-            viewport: Viewport::default(),
-            nodes,
-            last_mouse_position: None,
-            is_panning: false,
-        };
-        this.layout();
-        this
+        self.nodes = new_nodes;
+        self.layout();
+        cx.notify();
+    }
+
+    fn populate_children(&self, node: &mut GraphNode, worktree: &project::Worktree) {
+        if node.is_dir {
+            if let Some(entry) = worktree.entry_for_id(node.entry_id) {
+                for child_entry in worktree.child_entries(&entry.path) {
+                    let is_expanded = self
+                        .find_old_expanded_state(child_entry.id)
+                        .unwrap_or(false);
+
+                    let mut child_node = GraphNode {
+                        name: child_entry
+                            .path
+                            .file_name()
+                            .map(|n| n.to_string())
+                            .unwrap_or_default(),
+                        worktree_id: worktree.id(),
+                        entry_id: child_entry.id,
+                        is_dir: child_entry.is_dir(),
+                        is_expanded,
+                        world_position: Point::default(),
+                        children: Vec::new(),
+                    };
+
+                    // Only recurse if expanded
+                    if is_expanded {
+                        self.populate_children(&mut child_node, worktree);
+                    } else if child_node.is_dir {
+                        // Even if not expanded, we might want to populate one level of children
+                        // for the "collapsed" preview if we still want that.
+                        // For now, let's just keep it simple and not recurse.
+                    }
+
+                    node.children.push(child_node);
+                }
+            }
+        }
+    }
+
+    fn find_old_expanded_state(&self, entry_id: ProjectEntryId) -> Option<bool> {
+        fn find_recursive(nodes: &[GraphNode], entry_id: ProjectEntryId) -> Option<bool> {
+            for node in nodes {
+                if node.entry_id == entry_id {
+                    return Some(node.is_expanded);
+                }
+                if let Some(state) = find_recursive(&node.children, entry_id) {
+                    return Some(state);
+                }
+            }
+            None
+        }
+        find_recursive(&self.nodes, entry_id)
     }
 
     fn on_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
@@ -166,23 +237,23 @@ impl GraphLensPanel {
         )
     }
 
-    fn toggle_expanded(&mut self, node_name: String, cx: &mut Context<Self>) {
-        fn toggle_recursive(nodes: &mut Vec<GraphNode>, name: &str) -> bool {
+    fn toggle_expanded(&mut self, entry_id: ProjectEntryId, cx: &mut Context<Self>) {
+        fn toggle_recursive(nodes: &mut [GraphNode], entry_id: ProjectEntryId) -> bool {
             for node in nodes {
-                if node.name == name && node.is_dir {
+                if node.entry_id == entry_id && node.is_dir {
                     node.is_expanded = !node.is_expanded;
                     return true;
                 }
-                if toggle_recursive(&mut node.children, name) {
+                if toggle_recursive(&mut node.children, entry_id) {
                     return true;
                 }
             }
             false
         }
 
-        if toggle_recursive(&mut self.nodes, &node_name) {
-            self.layout();
-            cx.notify();
+        if toggle_recursive(&mut self.nodes, entry_id) {
+            // Rebuild nodes to ensure children are populated correctly
+            self.update_nodes(cx);
         }
     }
 
@@ -224,7 +295,7 @@ impl GraphLensPanel {
 
     fn render_node(&self, node: &GraphNode, cx: &mut Context<Self>) -> AnyElement {
         let screen_pos = self.world_to_screen(node.world_position);
-        let node_name = node.name.clone();
+        let entry_id = node.entry_id;
         let zoom = self.viewport.zoom;
 
         // Calculate height for the container if collapsed
@@ -269,7 +340,7 @@ impl GraphLensPanel {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _event, _window, cx| {
-                            this.toggle_expanded(node_name.clone(), cx);
+                            this.toggle_expanded(entry_id, cx);
                         }),
                     ),
             )
@@ -392,7 +463,7 @@ impl Panel for GraphLensPanel {
     }
 
     fn set_active(&mut self, _active: bool, _window: &mut Window, _cx: &mut Context<Self>) {
-        // You can store the active state here if you need to react to it,
+        // Store the active state
         // e.g., self.active = active;
     }
 
@@ -429,7 +500,7 @@ impl Panel for GraphLensPanel {
         1000
     }
 
-    // THIS is what physically puts the icon in the bottom bar
+    // Puts the icon in the bottom bar
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
         Some(IconName::FileTree)
     }
@@ -438,7 +509,7 @@ impl Panel for GraphLensPanel {
         Some("Toggle Graph Lens")
     }
 
-    // This links the UI button back to the action you registered in `init`
+    // Link the UI button back to the action you registered in `init`
     fn toggle_action(&self) -> Box<dyn Action> {
         Box::new(ToggleFocus)
     }
