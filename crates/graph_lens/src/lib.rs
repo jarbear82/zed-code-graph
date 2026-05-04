@@ -173,6 +173,7 @@ pub struct GraphLensPanel {
     last_mouse_pos: Option<Point<f32>>,
     is_panning: bool,
     config: LayoutConfig,
+    root_name: Option<String>,
 }
 
 impl GraphLensPanel {
@@ -187,7 +188,10 @@ impl GraphLensPanel {
                 | project::Event::WorktreeOrderChanged => {
                     this.update_nodes(cx);
                 }
-                _ => {}
+                _ => {
+                    // Intentionally ignored: other project events don't affect
+                    // the graph lens tree structure.
+                }
             },
         )
         .detach();
@@ -201,6 +205,7 @@ impl GraphLensPanel {
             last_mouse_pos: None,
             is_panning: false,
             config: LayoutConfig::default(),
+            root_name: None,
         };
         this.update_nodes(cx);
         this
@@ -210,43 +215,54 @@ impl GraphLensPanel {
         let mut new_nodes = Vec::new();
         let project = self.project.read(cx);
 
-        // Collect all expanded entry IDs for O(1) lookup.
-        let mut expanded_set = HashSet::new();
-        for node in &self.nodes {
-            if node.is_expanded {
-                expanded_set.insert(node.entry_id);
-            }
-        }
-        self.expanded_set = expanded_set;
+        // Determine if we should hide the root and show its children instead.
+        let visible_worktrees: Vec<_> = project.visible_worktrees(cx).collect();
+        let hide_root = visible_worktrees.len() == 1;
+
+        // Extract the root name for toolbar display when hiding the root.
+        self.root_name = if hide_root {
+            visible_worktrees.first().and_then(|wt| {
+                let path = wt.read(cx).abs_path();
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
+        } else {
+            None
+        };
 
         for worktree in project.worktrees(cx) {
             let worktree = worktree.read(cx);
             if let Some(root) = worktree.root_entry() {
-                let is_expanded = self
-                    .nodes
-                    .iter()
-                    .find(|n| n.entry_id == root.id)
-                    .map(|n| n.is_expanded)
-                    .or_else(|| self.expanded_set.contains(&root.id).then(|| true))
-                    .unwrap_or(true);
-
-                let mut node = GraphNode {
-                    name: worktree
-                        .abs_path()
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "Root".to_string()),
-                    worktree_id: worktree.id(),
-                    entry_id: root.id,
-                    is_dir: root.is_dir(),
-                    is_expanded,
-                    world_position: Point::default(),
-                    world_size: Point::default(),
-                    children: Vec::new(),
+                let entries_to_process: Vec<_> = if hide_root {
+                    worktree.child_entries(&root.path).collect()
+                } else {
+                    vec![root]
                 };
 
-                self.populate_tree(&mut node, &worktree);
-                new_nodes.push(node);
+                for child_entry in entries_to_process {
+                    let is_expanded = self.expanded_set.contains(&child_entry.id);
+
+                    let mut node = GraphNode {
+                        name: child_entry
+                            .path
+                            .file_name()
+                            .map(|n| n.to_string())
+                            .unwrap_or_default(),
+                        worktree_id: worktree.id(),
+                        entry_id: child_entry.id,
+                        is_dir: child_entry.is_dir(),
+                        is_expanded,
+                        world_position: Point::default(),
+                        world_size: Point::default(),
+                        children: Vec::new(),
+                    };
+
+                    if node.is_dir && is_expanded {
+                        self.populate_tree(&mut node, &worktree);
+                    }
+
+                    new_nodes.push(node);
+                }
             }
         }
 
@@ -306,20 +322,23 @@ impl GraphLensPanel {
 
     fn on_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
         let dy = event.delta.pixel_delta(px(1.0)).y.as_f32();
-        self.viewport.zoom *= 1.0 + dy * ZOOM_SCROLL_SENSITIVITY;
+        let multiplier = 1.0 + dy * ZOOM_SCROLL_SENSITIVITY;
+        self.viewport.zoom *= multiplier.max(0.0);
         self.viewport.zoom = self.viewport.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
         cx.notify();
     }
 
-    fn on_mouse_down(&mut self, event: &MouseDownEvent, _cx: &mut Context<Self>) {
+    fn on_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         if event.button == MouseButton::Left {
             self.is_panning = true;
+            cx.stop_propagation();
         }
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, cx: &mut Context<Self>) {
         self.is_panning = false;
         self.last_mouse_pos = None;
+        cx.stop_propagation();
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
@@ -334,21 +353,12 @@ impl GraphLensPanel {
     }
 
     fn toggle_expanded(&mut self, entry_id: ProjectEntryId, cx: &mut Context<Self>) {
-        fn toggle(nodes: &mut Vec<GraphNode>, id: ProjectEntryId) -> bool {
-            for n in nodes {
-                if n.entry_id == id && n.is_dir {
-                    n.is_expanded = !n.is_expanded;
-                    return true;
-                }
-                if toggle(&mut n.children, id) {
-                    return true;
-                }
-            }
-            false
+        if self.expanded_set.contains(&entry_id) {
+            self.expanded_set.remove(&entry_id);
+        } else {
+            self.expanded_set.insert(entry_id);
         }
-        if toggle(&mut self.nodes, entry_id) {
-            self.update_nodes(cx);
-        }
+        self.update_nodes(cx);
     }
 
     // ── Coordinate helper ──
@@ -417,6 +427,12 @@ impl GraphLensPanel {
                 .child(Label::new(label).size(label_size).color(Color::Muted))
         };
 
+        let title = if let Some(ref name) = self.root_name {
+            format!("Graph Lens — {}", name)
+        } else {
+            "Graph Lens".to_string()
+        };
+
         div()
             .h_8()
             .flex()
@@ -428,11 +444,9 @@ impl GraphLensPanel {
             .border_b_1()
             .border_color(border)
             .child(
-                div().px_1().child(
-                    Label::new("Graph Lens")
-                        .size(label_size)
-                        .color(Color::Muted),
-                ),
+                div()
+                    .px_1()
+                    .child(Label::new(title).size(label_size).color(Color::Muted)),
             )
             .child(div().w(px(1.0)).h_4().mx_1().bg(border))
             .child(btn("−").on_mouse_down(MouseButton::Left, {
@@ -486,6 +500,9 @@ impl GraphLensPanel {
         let h = px(node.world_size.y * z);
         let entry_id = node.entry_id;
 
+        let type_prefix = type_prefix(node.is_dir);
+        let expand_icon = if node.is_expanded { "▼" } else { "▶" };
+
         div()
             .absolute()
             .left(sp.x)
@@ -515,8 +532,11 @@ impl GraphLensPanel {
                             this.toggle_expanded(entry_id, cx);
                         }),
                     )
-                    .child(Label::new("▼").size(LabelSize::XSmall))
-                    .child(Label::new(format!("Dir. : {}", node.name)).size(LabelSize::XSmall)),
+                    .child(Label::new(expand_icon).size(LabelSize::XSmall))
+                    .child(
+                        Label::new(format!("{type_prefix} : {}", node.name))
+                            .size(LabelSize::XSmall),
+                    ),
             )
             .into_any_element()
     }
@@ -580,12 +600,15 @@ impl GraphLensPanel {
         expanded: &mut Vec<&'a GraphNode>,
         leaves: &mut Vec<&'a GraphNode>,
     ) {
-        for n in nodes {
-            if n.is_dir && n.is_expanded {
-                expanded.push(n);
-                Self::collect_nodes(&n.children, expanded, leaves);
-            } else {
-                leaves.push(n);
+        let mut stack = vec![nodes];
+        while let Some(current) = stack.pop() {
+            for n in current {
+                if n.is_dir && n.is_expanded {
+                    expanded.push(n);
+                    stack.push(&n.children);
+                } else {
+                    leaves.push(n);
+                }
             }
         }
     }
