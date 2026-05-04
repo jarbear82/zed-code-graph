@@ -1,6 +1,6 @@
 use gpui::{
     Action, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rems, Render,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
     ScrollWheelEvent, Window, actions, prelude::*, px,
 };
 use project::{Project, ProjectEntryId, WorktreeId};
@@ -29,7 +29,7 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-// ─── Layout constants ────────────────────────────────────────────────
+// ─── Layout constants ──
 
 const NODE_W: f32 = 200.0;
 const HEADER_H: f32 = 30.0;
@@ -38,9 +38,28 @@ const ATTR_BOTTOM_PAD: f32 = 6.0;
 const INNER_PAD: f32 = 14.0;
 const CHILD_GAP: f32 = 10.0;
 const ROOT_GAP: f32 = 24.0;
-const BASE_REM: Rems = rems(12.0);
 
-// ─── Viewport ────────────────────────────────────────────────────────
+// ─── Viewport constants ──
+
+const DEFAULT_PAN: Point<f32> = Point::new(20.0, 20.0);
+const DEFAULT_ZOOM: f32 = 1.0;
+const ZOOM_MIN: f32 = 0.1;
+const ZOOM_MAX: f32 = 5.0;
+const ZOOM_CLICK_STEP: f32 = 0.1;
+const ZOOM_SCROLL_SENSITIVITY: f32 = 0.002;
+
+// ─── Canvas constants ──
+
+const ROOT_PAD_X: f32 = 60.0;
+const ROOT_PAD_Y: f32 = 60.0;
+
+// ─── UI constants ──
+
+const HEADER_PAD: f32 = 8.0;
+const HEADER_GAP: f32 = 6.0;
+const ATTR_PAD: f32 = 14.0;
+
+// ─── Viewport struct ──
 
 pub struct Viewport {
     pub pan: Point<f32>,
@@ -50,8 +69,8 @@ pub struct Viewport {
 impl Default for Viewport {
     fn default() -> Self {
         Self {
-            pan: Point::new(20.0, 20.0),
-            zoom: 1.0,
+            pan: DEFAULT_PAN,
+            zoom: DEFAULT_ZOOM,
         }
     }
 }
@@ -276,9 +295,9 @@ impl GraphLensPanel {
 
     fn layout(&mut self) {
         let mut nodes = std::mem::take(&mut self.nodes);
-        let mut y = 60.0;
+        let mut y = ROOT_PAD_Y;
         for node in &mut nodes {
-            layout_node(node, Point::new(60.0, y));
+            layout_node(node, Point::new(ROOT_PAD_X, y));
             y += node.world_size.y + ROOT_GAP;
         }
         self.nodes = nodes;
@@ -288,8 +307,8 @@ impl GraphLensPanel {
 
     fn on_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
         let dy = event.delta.pixel_delta(px(1.0)).y.as_f32();
-        self.viewport.zoom *= 1.0 + dy * 0.002;
-        self.viewport.zoom = self.viewport.zoom.clamp(0.1, 5.0);
+        self.viewport.zoom *= 1.0 + dy * ZOOM_SCROLL_SENSITIVITY;
+        self.viewport.zoom = self.viewport.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
         cx.notify();
     }
 
@@ -390,7 +409,7 @@ impl GraphLensPanel {
                 let view = view.clone();
                 move |_, _window, cx| {
                     view.update(cx, |this, cx| {
-                        this.viewport.zoom = (this.viewport.zoom - 0.1).max(0.1);
+                        this.viewport.zoom = (this.viewport.zoom - ZOOM_CLICK_STEP).max(ZOOM_MIN);
                         cx.notify();
                     });
                 }
@@ -406,7 +425,7 @@ impl GraphLensPanel {
                 let view = view.clone();
                 move |_, _window, cx| {
                     view.update(cx, |this, cx| {
-                        this.viewport.zoom = (this.viewport.zoom + 0.1).min(5.0);
+                        this.viewport.zoom = (this.viewport.zoom + ZOOM_CLICK_STEP).min(ZOOM_MAX);
                         cx.notify();
                     });
                 }
@@ -448,11 +467,11 @@ impl GraphLensPanel {
             .child(
                 div()
                     .h(px(HEADER_H * z))
-                    .px(px(8.0 * z))
+                    .px(px(HEADER_PAD * z))
                     .flex()
                     .flex_shrink_0()
                     .items_center()
-                    .gap(px(6.0 * z))
+                    .gap(px(HEADER_GAP * z))
                     .bg(cx.theme().colors().element_background)
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
@@ -482,11 +501,11 @@ impl GraphLensPanel {
 
         let header = div()
             .h(px(HEADER_H * z))
-            .px(px(8.0 * z))
+            .px(px(HEADER_PAD * z))
             .flex()
             .flex_shrink_0()
             .items_center()
-            .gap(px(6.0 * z))
+            .gap(px(HEADER_GAP * z))
             .bg(cx.theme().colors().element_background)
             .border_b_1()
             .border_color(cx.theme().colors().border)
@@ -520,7 +539,7 @@ impl GraphLensPanel {
                 card = card.child(
                     div()
                         .h(px(ATTR_H * z))
-                        .px(px(14.0 * z))
+                        .px(px(ATTR_PAD * z))
                         .flex()
                         .flex_shrink_0()
                         .items_center()
