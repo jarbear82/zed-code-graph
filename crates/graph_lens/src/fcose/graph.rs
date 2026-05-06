@@ -1,4 +1,4 @@
-use crate::math::Vector2;
+use super::math::Vector2;
 use hashbrown::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -25,8 +25,6 @@ pub struct Node {
     pub children: Vec<NodeId>,
     /// Parent compound node, if any.
     pub parent_id: Option<NodeId>,
-    /// If set, the node is pinned to this position (fixed-node constraint).
-    pub fixed_pos: Option<Vector2>,
 }
 
 impl Node {
@@ -39,7 +37,6 @@ impl Node {
             is_compound: false,
             children: Vec::new(),
             parent_id: None,
-            fixed_pos: None,
         }
     }
 
@@ -52,7 +49,6 @@ impl Node {
             is_compound: true,
             children: Vec::new(),
             parent_id: None,
-            fixed_pos: None,
         }
     }
 
@@ -81,11 +77,19 @@ pub struct Edge {
 
 impl Edge {
     pub fn new(source: NodeId, target: NodeId) -> Self {
-        Self { source, target, weight: 1.0 }
+        Self {
+            source,
+            target,
+            weight: 1.0,
+        }
     }
 
     pub fn weighted(source: NodeId, target: NodeId, weight: f64) -> Self {
-        Self { source, target, weight }
+        Self {
+            source,
+            target,
+            weight,
+        }
     }
 }
 
@@ -167,7 +171,7 @@ impl CompoundGraph {
         let n = self.node_mut(id);
         // Center of [min - padding, max + padding] is still (min + max) / 2.
         n.pos = Vector2::new((min_x + max_x) * 0.5, (min_y + max_y) * 0.5);
-        n.width  = (max_x - min_x) + padding * 2.0;
+        n.width = (max_x - min_x) + padding * 2.0;
         n.height = (max_y - min_y) + padding * 2.0;
     }
 }

@@ -8,8 +8,8 @@
 //!      Total cost O(k(n+m)) ≈ O(n+m) for k = O(√n).
 //!   3. Postprocessing – strip dummy positions; restore compound bounds (§4.1.3).
 
-use crate::graph::{CompoundGraph, DUMMY_ID_BASE, NodeId};
-use crate::math::Vector2;
+use super::graph::{CompoundGraph, DUMMY_ID_BASE, NodeId};
+use super::math::Vector2;
 use hashbrown::{HashMap, HashSet};
 use nalgebra::DMatrix;
 use std::collections::VecDeque;

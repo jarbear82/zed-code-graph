@@ -1,7 +1,7 @@
 //! Phase II — transformation and constraint enforcement (§4.2, Algorithm 2).
 
-use crate::graph::{CompoundGraph, NodeId};
-use crate::math::Vector2;
+use super::graph::{CompoundGraph, NodeId};
+use super::math::Vector2;
 use hashbrown::{HashMap, HashSet};
 use nalgebra::Matrix2;
 use std::collections::VecDeque;
@@ -67,7 +67,11 @@ impl<'g> ConstraintPhase<'g> {
     /// constraints (§4.2.1 bullet 3).
     fn apply_transformation(&mut self) {
         if self.fixed.len() > 1 {
-            let src: Vec<_> = self.fixed.iter().map(|fc| self.graph.node(fc.id).pos).collect();
+            let src: Vec<_> = self
+                .fixed
+                .iter()
+                .map(|fc| self.graph.node(fc.id).pos)
+                .collect();
             let tgt: Vec<_> = self.fixed.iter().map(|fc| fc.pos).collect();
             if let Some(t) = Self::procrustes(&src, &tgt) {
                 Self::apply_matrix(self.graph, &t);
@@ -213,8 +217,16 @@ impl<'g> ConstraintPhase<'g> {
         }
 
         let largest_set: HashSet<NodeId> = largest.iter().copied().collect();
-        let vih: Vec<NodeId> = dh_nodes.iter().filter(|n| largest_set.contains(*n)).copied().collect();
-        let viv: Vec<NodeId> = dv_nodes.iter().filter(|n| largest_set.contains(*n)).copied().collect();
+        let vih: Vec<NodeId> = dh_nodes
+            .iter()
+            .filter(|n| largest_set.contains(*n))
+            .copied()
+            .collect();
+        let viv: Vec<NodeId> = dv_nodes
+            .iter()
+            .filter(|n| largest_set.contains(*n))
+            .copied()
+            .collect();
 
         let x_targets = Self::longest_path_distances(&dh_edges, &vih);
         let y_targets = Self::longest_path_distances(&dv_edges, &viv);
@@ -264,7 +276,11 @@ impl<'g> ConstraintPhase<'g> {
             // Reflect if strictly more than half are violated.
             if satisfied * 2 < n {
                 for nd in &mut graph.nodes {
-                    if horiz { nd.pos.x = -nd.pos.x; } else { nd.pos.y = -nd.pos.y; }
+                    if horiz {
+                        nd.pos.x = -nd.pos.x;
+                    } else {
+                        nd.pos.y = -nd.pos.y;
+                    }
                 }
             }
         }

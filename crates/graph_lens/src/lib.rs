@@ -11,6 +11,14 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
+mod fcose;
+
+use fcose::{
+    graph::{CompoundGraph, Node as FcoseNode, NodeId},
+    run_layout,
+};
+use std::collections::HashMap;
+
 actions!(graph_lens, [ToggleFocus]);
 
 pub fn init(cx: &mut App) {
@@ -36,9 +44,6 @@ const NODE_W: f32 = 200.0;
 const HEADER_H: f32 = 30.0;
 const ATTR_H: f32 = 22.0;
 const ATTR_BOTTOM_PAD: f32 = 6.0;
-const INNER_PAD: f32 = 14.0;
-const CHILD_GAP: f32 = 10.0;
-const ROOT_GAP: f32 = 24.0;
 
 const DEFAULT_PAN: Point<f32> = Point::new(20.0, 20.0);
 const DEFAULT_ZOOM: f32 = 1.0;
@@ -46,9 +51,6 @@ const ZOOM_MIN: f32 = 0.1;
 const ZOOM_MAX: f32 = 5.0;
 const ZOOM_CLICK_STEP: f32 = 0.1;
 const ZOOM_SCROLL_SENSITIVITY: f32 = 0.002;
-
-const ROOT_PAD_X: f32 = 60.0;
-const ROOT_PAD_Y: f32 = 60.0;
 
 const HEADER_PAD: f32 = 8.0;
 const HEADER_GAP: f32 = 6.0;
@@ -61,11 +63,6 @@ struct LayoutConfig {
     header_height: f32,
     attr_height: f32,
     attr_bottom_pad: f32,
-    inner_pad: f32,
-    child_gap: f32,
-    root_gap: f32,
-    root_pad_x: f32,
-    root_pad_y: f32,
     header_pad: f32,
     header_gap: f32,
     attr_pad: f32,
@@ -78,11 +75,6 @@ impl Default for LayoutConfig {
             header_height: HEADER_H,
             attr_height: ATTR_H,
             attr_bottom_pad: ATTR_BOTTOM_PAD,
-            inner_pad: INNER_PAD,
-            child_gap: CHILD_GAP,
-            root_gap: ROOT_GAP,
-            root_pad_x: ROOT_PAD_X,
-            root_pad_y: ROOT_PAD_Y,
             header_pad: HEADER_PAD,
             header_gap: HEADER_GAP,
             attr_pad: ATTR_PAD,
@@ -121,47 +113,6 @@ pub struct GraphNode {
     pub children: Vec<GraphNode>,
 }
 
-/// Compute world-space position and size for `node` and all descendants.
-fn layout_node(node: &mut GraphNode, pos: Point<f32>, config: &LayoutConfig) {
-    node.world_position = pos;
-
-    if !node.is_dir {
-        node.world_size = Point::new(config.node_width, config.header_height);
-        return;
-    }
-
-    if !node.is_expanded {
-        let rows = node.children.len() as f32;
-        let h = config.header_height
-            + if rows > 0.0 {
-                rows * config.attr_height + config.attr_bottom_pad
-            } else {
-                0.0
-            };
-        node.world_size = Point::new(config.node_width, h);
-        return;
-    }
-
-    let child_x = pos.x + config.inner_pad;
-    let mut child_y = pos.y + config.header_height + config.inner_pad;
-    let mut max_child_w: f32 = 0.0;
-
-    for child in &mut node.children {
-        layout_node(child, Point::new(child_x, child_y), config);
-        child_y += child.world_size.y + config.child_gap;
-        max_child_w = max_child_w.max(child.world_size.x);
-    }
-
-    let total_h = if node.children.is_empty() {
-        config.header_height + config.inner_pad * 2.0
-    } else {
-        (child_y - config.child_gap + config.inner_pad) - pos.y
-    };
-    let total_w = (max_child_w + config.inner_pad * 2.0).max(config.node_width);
-
-    node.world_size = Point::new(total_w, total_h);
-}
-
 // ─── Panel ───
 
 pub struct GraphLensPanel {
@@ -169,6 +120,7 @@ pub struct GraphLensPanel {
     focus_handle: FocusHandle,
     viewport: Viewport,
     nodes: Vec<GraphNode>,
+    dependencies: Vec<(ProjectEntryId, ProjectEntryId)>,
     expanded_set: HashSet<ProjectEntryId>,
     last_mouse_pos: Option<Point<f32>>,
     is_panning: bool,
@@ -201,6 +153,7 @@ impl GraphLensPanel {
             focus_handle: cx.focus_handle(),
             viewport: Viewport::default(),
             nodes: Vec::new(),
+            dependencies: Vec::new(),
             expanded_set: HashSet::new(),
             last_mouse_pos: None,
             is_panning: false,
@@ -230,6 +183,9 @@ impl GraphLensPanel {
             None
         };
 
+        // =========================================================
+        // 1. Build the File Tree (Compound Nodes / Bounding Boxes)
+        // =========================================================
         for worktree in project.worktrees(cx) {
             let worktree = worktree.read(cx);
             if let Some(root) = worktree.root_entry() {
@@ -266,8 +222,45 @@ impl GraphLensPanel {
             }
         }
 
+        // =========================================================
+        // 2. Gather Dependencies (fCoSE Adjacency Edges / Springs)
+        // =========================================================
+        let mut new_deps = Vec::new();
+
+        // TODO: Hook up your Language Server or Tree-sitter parser here.
+        // Once you extract which files import which other files, push them
+        // as a tuple of (SourceEntryId, TargetEntryId) into `new_deps`.
+        //
+        // Example conceptual implementation:
+        // for worktree in project.worktrees(cx) {
+        //     let wt = worktree.read(cx);
+        //     for file in wt.files(cx) {
+        //         // Ask the project/LSP for imports found in this file
+        //         if let Some(imported_files) = project.get_imports(file.id, cx) {
+        //             for target_file_id in imported_files {
+        //                 new_deps.push((file.id, target_file_id));
+        //             }
+        //         }
+        //     }
+        // }
+
+        // Quick dummy test: Connect the 1st file to the 2nd file in your tree to see them snap together
+        if new_nodes.len() >= 2 {
+            let file_a = new_nodes[0].entry_id;
+            let file_b = new_nodes[1].entry_id;
+            new_deps.push((file_a, file_b));
+        }
+
+        // =========================================================
+        // 3. Update State & Run Physics Engine
+        // =========================================================
+        self.dependencies = new_deps;
         self.nodes = new_nodes;
+
+        // Triggers the fCoSE algorithm in `self.layout()` using the newly
+        // generated nodes and dependencies
         self.layout();
+
         cx.notify();
     }
 
@@ -309,13 +302,118 @@ impl GraphLensPanel {
     }
 
     fn layout(&mut self) {
-        let mut nodes = std::mem::take(&mut self.nodes);
-        let mut y = self.config.root_pad_y;
-        for node in &mut nodes {
-            layout_node(node, Point::new(self.config.root_pad_x, y), &self.config);
-            y += node.world_size.y + self.config.root_gap;
+        if self.nodes.is_empty() {
+            return;
         }
-        self.nodes = nodes;
+
+        let mut cg = CompoundGraph::new();
+        let mut entry_to_node = HashMap::new();
+        let mut node_counter = 0u32;
+
+        // Step 1: Flatten the tree and build fCoSE nodes
+        self.build_fcose_nodes(
+            &self.nodes,
+            None,
+            &mut cg,
+            &mut entry_to_node,
+            &mut node_counter,
+        );
+
+        // Step 2: Add Adjacency Edges!
+        // Loop through the dependencies we saved in our panel state
+        for (source_entry_id, target_entry_id) in &self.dependencies {
+            // Only add the edge if BOTH files are currently visible in the graph
+            if let (Some(&fcose_source), Some(&fcose_target)) = (
+                entry_to_node.get(source_entry_id),
+                entry_to_node.get(target_entry_id),
+            ) {
+                cg.add_edge(fcose_source, fcose_target);
+            }
+        }
+
+        // Step 3: Run the fCoSE layout engine
+        run_layout(&mut cg, &[], &[], &[], 100);
+
+        // Step 4: Map the computed positions back to GPUI world coordinates
+        Self::apply_fcose_positions(&mut self.nodes, &cg, &entry_to_node);
+    }
+
+    /// Recursively create fCoSE nodes from the UI state
+    fn build_fcose_nodes(
+        &self,
+        ui_nodes: &[GraphNode],
+        parent_id: Option<NodeId>,
+        cg: &mut CompoundGraph,
+        map: &mut HashMap<ProjectEntryId, NodeId>,
+        counter: &mut u32,
+    ) -> Vec<NodeId> {
+        let mut sibling_ids = Vec::new();
+
+        for ui_node in ui_nodes {
+            let id = NodeId(*counter);
+            *counter += 1;
+            map.insert(ui_node.entry_id, id);
+            sibling_ids.push(id);
+
+            // Determine dimensions based on whether it's expanded or a leaf
+            let (w, h) = if ui_node.is_dir && ui_node.is_expanded {
+                // fCoSE will recalculate compound bounds automatically during the physics tick,
+                // so we can initialize this at 0.
+                (0.0, 0.0)
+            } else {
+                // Leaf nodes or collapsed dirs use static sizes
+                let rows = if ui_node.is_dir {
+                    ui_node.children.len() as f32
+                } else {
+                    0.0
+                };
+                let h = self.config.header_height + (rows * self.config.attr_height);
+                (self.config.node_width, h)
+            };
+
+            let mut fcose_node = if ui_node.is_dir && ui_node.is_expanded {
+                FcoseNode::new_compound(id)
+            } else {
+                FcoseNode::new(id, w.into(), h.into())
+            };
+
+            fcose_node.parent_id = parent_id;
+
+            // Recurse for children if expanded
+            if ui_node.is_dir && ui_node.is_expanded {
+                fcose_node.children =
+                    self.build_fcose_nodes(&ui_node.children, Some(id), cg, map, counter);
+            }
+
+            cg.add_node(fcose_node);
+        }
+
+        sibling_ids
+    }
+
+    /// Recursively read the fCoSE positions back into the UI GraphNodes
+    fn apply_fcose_positions(
+        ui_nodes: &mut [GraphNode],
+        cg: &CompoundGraph,
+        map: &HashMap<ProjectEntryId, NodeId>,
+    ) {
+        for ui_node in ui_nodes {
+            if let Some(&fcose_id) = map.get(&ui_node.entry_id) {
+                let cg_node = cg.node(fcose_id);
+
+                // fCoSE positions nodes by their CENTER.
+                // GPUI expects the TOP-LEFT corner for layout.
+                let top_left_x = cg_node.pos.x - (cg_node.width * 0.5);
+                let top_left_y = cg_node.pos.y - (cg_node.height * 0.5);
+
+                ui_node.world_position = Point::new(top_left_x as f32, top_left_y as f32);
+                ui_node.world_size = Point::new(cg_node.width as f32, cg_node.height as f32);
+            }
+
+            if ui_node.is_dir && ui_node.is_expanded {
+                Self::apply_fcose_positions(&mut ui_node.children, cg, map);
+            }
+        }
     }
 
     // ── Input handlers ───
@@ -483,6 +581,20 @@ impl GraphLensPanel {
                     cx.stop_propagation();
                     view.update(cx, |this, cx| {
                         this.viewport = Viewport::default();
+                        cx.notify();
+                    });
+                }
+            }))
+            .child(div().w(px(1.0)).h_4().mx_1().bg(border))
+            // Add the Run Layout button
+            .child(btn("Run Layout").on_mouse_down(MouseButton::Left, {
+                let view = view.clone();
+                move |_event, _window, cx| {
+                    cx.stop_propagation();
+                    view.update(cx, |this, cx| {
+                        // Trigger the fCoSE algorithm and update the GPUI coordinates
+                        this.layout();
+                        // Tell GPUI to re-render the screen
                         cx.notify();
                     });
                 }

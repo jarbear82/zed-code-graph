@@ -12,9 +12,9 @@
 //!     all-pairs loop.
 //!   • Calibrated cooling — the cooling rate scales with graph size.
 
-use crate::constraints::{AlignmentConstraint, FixedConstraint, RelativeConstraint};
-use crate::graph::{CompoundGraph, NodeId};
-use crate::math::Vector2;
+use super::constraints::{AlignmentConstraint, FixedConstraint, RelativeConstraint};
+use super::graph::{CompoundGraph, NodeId};
+use super::math::Vector2;
 use rstar::{AABB, RTree, primitives::GeomWithData};
 
 type SpatialEntry = GeomWithData<[f64; 2], usize>;
@@ -120,24 +120,30 @@ impl PhysicsEngine {
             if graph.nodes[i].is_compound {
                 continue;
             }
-            let p = graph.nodes[i].pos;
 
+            let p = graph.nodes[i].pos;
+            let hw = graph.nodes[i].width * 0.5;
+            let hh = graph.nodes[i].height * 0.5;
+
+            // Expand the envelope by the node's dimensions so we don't miss
+            // large overlapping nodes whose centers are far away.
             let env = AABB::from_corners(
-                [p.x - search_r, p.y - search_r],
-                [p.x + search_r, p.y + search_r],
+                [p.x - hw - search_r, p.y - hh - search_r],
+                [p.x + hw + search_r, p.y + hh + search_r],
             );
+
             for entry in tree.locate_in_envelope(&env) {
                 let j = entry.data;
                 if i == j {
                     continue;
                 }
-                forces[i] += self.repulsion(p, graph.nodes[j].pos);
+                // Pass the full node references to account for bounding boxes
+                forces[i] += self.repulsion(&graph.nodes[i], &graph.nodes[j]);
             }
 
             // Restoring force: keep node inside its parent compound's bounds.
             if let Some(pid) = graph.nodes[i].parent_id {
                 let bb = graph.node(pid).aabb();
-                let (hw, hh) = (graph.nodes[i].width * 0.5, graph.nodes[i].height * 0.5);
                 let pen_x = f64::max(0.0, bb[0] - (p.x - hw)) - f64::max(0.0, (p.x + hw) - bb[2]);
                 let pen_y = f64::max(0.0, bb[1] - (p.y - hh)) - f64::max(0.0, (p.y + hh) - bb[3]);
                 forces[i] += Vector2::new(pen_x, pen_y) * 0.5;
@@ -193,14 +199,41 @@ impl PhysicsEngine {
 
     /// Fruchterman-Reingold repulsion: f_r = k² / dist (§4.3, [13]).
     ///
-    /// FIX: the original formula was k² / dist³ (an inverse-square law);
     /// F-R specifies k² / dist which corresponds to
     ///   force_vector = (d / |d|) * k² / |d| = d * k² / |d|² = d * k² / dist_sq.
+    /// Modified Fruchterman-Reingold repulsion using AABB overlap resolution.
     #[inline]
-    fn repulsion(&self, a: Vector2, b: Vector2) -> Vector2 {
-        let d = a - b;
-        let dist_sq = d.length_sq().max(1.0);
-        d * (self.repulsion_k_sq / dist_sq)
+    fn repulsion(&self, node_a: &super::graph::Node, node_b: &super::graph::Node) -> Vector2 {
+        let d = node_a.pos - node_b.pos;
+
+        let min_dist_x = (node_a.width + node_b.width) * 0.5;
+        let min_dist_y = (node_a.height + node_b.height) * 0.5;
+
+        // Gap between the edges of the rectangles (negative means overlapping)
+        let gap_x = d.x.abs() - min_dist_x;
+        let gap_y = d.y.abs() - min_dist_y;
+
+        // Handle physical overlap (Collision Resolution)
+        if gap_x < 0.0 && gap_y < 0.0 {
+            // Apply a strong penalty force proportional to the penetration depth
+            let overlap_force_multiplier = 5.0;
+
+            if gap_x > gap_y {
+                // Penetrating less on the X axis, push horizontally
+                let sign = if d.x > 0.0 { 1.0 } else { -1.0 };
+                return Vector2::new(sign * gap_x.abs() * overlap_force_multiplier, 0.0);
+            } else {
+                // Penetrating less on the Y axis, push vertically
+                let sign = if d.y > 0.0 { 1.0 } else { -1.0 };
+                return Vector2::new(0.0, sign * gap_y.abs() * overlap_force_multiplier);
+            }
+        }
+
+        // Standard layout repulsion for nodes that are NOT overlapping
+        let effective_dist = gap_x.max(gap_y).max(1.0);
+        let dist_sq = effective_dist * effective_dist;
+
+        d.normalize() * (self.repulsion_k_sq / dist_sq)
     }
 
     #[inline]

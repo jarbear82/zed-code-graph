@@ -9,3 +9,6 @@ ui = { path = "../ui" }
 workspace = { path = "../workspace" }
 project = { path = "../project" }
 rustix = "0.38"
+hashbrown = "0.14"
+nalgebra = "0.32"
+rstar = "0.11"

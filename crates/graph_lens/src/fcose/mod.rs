@@ -4,11 +4,11 @@
 //! Phase II → constraints::ConstraintPhase::run   (transformation + enforcement)
 //! Phase III→ physics::PhysicsEngine::tick         (force-directed polishing)
 
-mod constraints;
-mod graph;
-mod math;
-mod physics;
-mod spectral;
+pub mod constraints;
+pub mod graph;
+pub mod math;
+pub mod physics;
+pub mod spectral;
 
 use constraints::{AlignmentConstraint, ConstraintPhase, FixedConstraint, RelativeConstraint};
 use graph::CompoundGraph;
