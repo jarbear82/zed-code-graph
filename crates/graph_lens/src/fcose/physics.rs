@@ -48,6 +48,28 @@ impl LayoutState {
 // PhysicsEngine
 // ---------------------------------------------------------------------------
 
+pub struct PhysicsConfig {
+    pub start_temperature: f64,
+    pub cooling_rate: f64,
+    pub ideal_edge_len: f64,
+    pub repulsion_k_sq: f64,
+    pub spring_k: f64,
+    pub compound_padding: f64,
+}
+
+impl Default for PhysicsConfig {
+    fn default() -> Self {
+        Self {
+            start_temperature: 100.0,
+            cooling_rate: 0.95,
+            ideal_edge_len: 50.0,
+            repulsion_k_sq: 2500.0,
+            spring_k: 0.1,
+            compound_padding: 10.0,
+        }
+    }
+}
+
 pub struct PhysicsEngine {
     pub temperature: f64,
     pub cooling_rate: f64,
@@ -56,17 +78,29 @@ pub struct PhysicsEngine {
     pub repulsion_k_sq: f64,
     pub spring_k: f64,
     pub compound_padding: f64,
+    pub spatial_tree: Option<RTree<SpatialEntry>>,
+    pub last_node_count: usize,
 }
 
-impl Default for PhysicsEngine {
-    fn default() -> Self {
+impl PhysicsEngine {
+    pub fn calibrate_with_config(graph_node_count: usize, config: PhysicsConfig) -> Self {
+        let cooling = if graph_node_count > 1000 {
+            0.99
+        } else if graph_node_count > 250 {
+            0.98
+        } else {
+            0.95
+        };
+
         Self {
-            temperature: 0.1,
-            cooling_rate: 0.95,
-            ideal_edge_len: 50.0,
-            repulsion_k_sq: 4500.0,
-            spring_k: 0.45,
-            compound_padding: 10.0,
+            temperature: config.start_temperature,
+            cooling_rate: cooling,
+            ideal_edge_len: config.ideal_edge_len,
+            repulsion_k_sq: config.repulsion_k_sq,
+            spring_k: config.spring_k,
+            compound_padding: config.compound_padding,
+            spatial_tree: None,
+            last_node_count: 0,
         }
     }
 }
@@ -75,15 +109,19 @@ impl PhysicsEngine {
     /// Choose a cooling rate appropriate for the graph size.
     /// Larger graphs need a slower decay to resolve complex overlaps.
     pub fn calibrate(num_nodes: usize) -> Self {
-        let mut engine = Self::default();
-        engine.cooling_rate = if num_nodes > 1000 {
-            0.99
-        } else if num_nodes > 250 {
-            0.98
-        } else {
-            0.95
-        };
-        engine
+        Self::calibrate_with_config(num_nodes, PhysicsConfig::default())
+    }
+
+    pub fn rebuild_tree(&mut self, graph: &CompoundGraph) {
+        let entries: Vec<SpatialEntry> = graph
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, nd)| !nd.is_compound)
+            .map(|(i, nd)| GeomWithData::new([nd.pos.x, nd.pos.y], i))
+            .collect();
+        self.spatial_tree = Some(RTree::bulk_load(entries));
+        self.last_node_count = graph.nodes.len();
     }
 
     /// One simulation tick — matches the inner loop of Algorithm 1.
@@ -95,6 +133,10 @@ impl PhysicsEngine {
         alignment: &[AlignmentConstraint],
         relative: &[RelativeConstraint],
     ) {
+        if graph.nodes.len() != self.last_node_count {
+            self.rebuild_tree(graph);
+        }
+
         let n = graph.nodes.len();
         if n == 0 || self.temperature < 1e-4 {
             return;
@@ -103,14 +145,10 @@ impl PhysicsEngine {
         // ── 1. Build R-Tree for O(N log N) repulsion ──
         // Compound nodes are excluded: their bounds are updated via
         // UpdateBounds, not by direct force application.
-        let entries: Vec<SpatialEntry> = graph
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, nd)| !nd.is_compound)
-            .map(|(i, nd)| GeomWithData::new([nd.pos.x, nd.pos.y], i))
-            .collect();
-        let tree = RTree::bulk_load(entries);
+        let tree = self
+            .spatial_tree
+            .as_ref()
+            .expect("R-Tree must be initialized");
 
         // ── 2. Accumulate forces ──
         let mut forces = vec![Vector2::ZERO; n];
@@ -158,7 +196,18 @@ impl PhysicsEngine {
         }
 
         // ── 3. Scale by temperature → candidate displacements ──
-        let mut disp: Vec<Vector2> = forces.iter().map(|&f| f * self.temperature).collect();
+        let mut disp: Vec<Vector2> = forces
+            .iter()
+            .map(|&f| {
+                let mut d = f * self.temperature;
+                let max_d = self.temperature;
+                let l = d.length();
+                if l > max_d {
+                    d = d * (max_d / l);
+                }
+                d
+            })
+            .collect();
 
         // ── 4. AdjustDisplacements (§4.3) ──
         Self::adjust_displacements(graph, &mut disp, fixed, alignment, relative);
@@ -297,5 +346,32 @@ impl PhysicsEngine {
                 disp[ri].set_coord(axis, new_r);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fcose::graph::{CompoundGraph, Node, NodeId};
+
+    #[test]
+    fn test_adjust_displacements_fixed_nodes() {
+        let mut graph = CompoundGraph::new();
+        let n1 = graph.add_node(Node::new(NodeId(0), 10.0, 10.0));
+        let n2 = graph.add_node(Node::new(NodeId(1), 10.0, 10.0));
+        graph.node_mut(n1).pos = Vector2::new(0.0, 0.0);
+        graph.node_mut(n2).pos = Vector2::new(10.0, 10.0);
+
+        let mut disp = vec![Vector2::new(5.0, 5.0), Vector2::new(5.0, 5.0)];
+        let fixed = vec![FixedConstraint {
+            id: n1,
+            pos: Vector2::new(0.0, 0.0),
+        }];
+        PhysicsEngine::adjust_displacements(&graph, &mut disp, &fixed, &[], &[]);
+
+        // Fixed node (n1) displacement must be zeroed out
+        assert_eq!(disp[0], Vector2::ZERO);
+        // Free node (n2) retains its original displacement
+        assert_eq!(disp[1], Vector2::new(5.0, 5.0));
     }
 }

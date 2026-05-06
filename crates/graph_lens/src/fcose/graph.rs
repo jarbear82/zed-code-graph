@@ -101,6 +101,7 @@ pub struct CompoundGraph {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub id_to_idx: HashMap<NodeId, usize>,
+    pub degrees: HashMap<NodeId, usize>,
 }
 
 impl CompoundGraph {
@@ -109,6 +110,7 @@ impl CompoundGraph {
             nodes: Vec::new(),
             edges: Vec::new(),
             id_to_idx: HashMap::new(),
+            degrees: HashMap::new(),
         }
     }
 
@@ -122,6 +124,9 @@ impl CompoundGraph {
 
     pub fn add_edge(&mut self, source: NodeId, target: NodeId) {
         self.edges.push(Edge::new(source, target));
+        // Update cached degrees
+        *self.degrees.entry(source).or_insert(0) += 1;
+        *self.degrees.entry(target).or_insert(0) += 1;
     }
 
     pub fn add_weighted_edge(&mut self, source: NodeId, target: NodeId, weight: f64) {
@@ -135,8 +140,25 @@ impl CompoundGraph {
 
     #[inline]
     pub fn node_mut(&mut self, id: NodeId) -> &mut Node {
+        debug_assert!(
+            self.id_to_idx.contains_key(&id),
+            "Invariant violation: attempted to access NodeId({}) which does not exist in the graph's ID map.",
+            id.0
+        );
         let idx = self.id_to_idx[&id];
         &mut self.nodes[idx]
+    }
+
+    pub fn remove_edge(&mut self, source: NodeId, target: NodeId) {
+        self.edges
+            .retain(|e| e.source != source || e.target != target);
+        // Update cached degrees (safe decrement)
+        if let Some(&deg) = self.degrees.get(&source) {
+            *self.degrees.get_mut(&source).unwrap() = deg.saturating_sub(1);
+        }
+        if let Some(&deg) = self.degrees.get(&target) {
+            *self.degrees.get_mut(&target).unwrap() = deg.saturating_sub(1);
+        }
     }
 
     pub fn degree(&self, id: NodeId) -> usize {

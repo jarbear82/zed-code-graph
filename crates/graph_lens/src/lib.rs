@@ -1,10 +1,16 @@
+use fcose::{
+    graph::{CompoundGraph, Node as FcoseNode, NodeId},
+    run_layout,
+};
 use gpui::{
     Action, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
     ScrollWheelEvent, Window, actions, prelude::*, px,
 };
 use project::{Project, ProjectEntryId, WorktreeId};
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ops::Add;
 use ui::{Color, IconName, Label, LabelSize, prelude::*};
 use workspace::{
     Workspace,
@@ -12,12 +18,6 @@ use workspace::{
 };
 
 mod fcose;
-
-use fcose::{
-    graph::{CompoundGraph, Node as FcoseNode, NodeId},
-    run_layout,
-};
-use std::collections::HashMap;
 
 actions!(graph_lens, [ToggleFocus]);
 
@@ -336,6 +336,35 @@ impl GraphLensPanel {
 
         // Step 4: Map the computed positions back to GPUI world coordinates
         Self::apply_fcose_positions(&mut self.nodes, &cg, &entry_to_node);
+        self.center_view();
+    }
+
+    fn center_view(&mut self) {
+        if self.nodes.is_empty() {
+            return;
+        }
+
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+
+        let mut stack = vec![self.nodes.as_slice()];
+        while let Some(nodes) = stack.pop() {
+            for n in nodes {
+                min_x = min_x.min(n.world_position.x);
+                min_y = min_y.min(n.world_position.y);
+                if n.is_dir && n.is_expanded {
+                    stack.push(&n.children);
+                }
+            }
+        }
+
+        if min_x != f32::MAX && min_y != f32::MAX {
+            let pad = 40.0;
+            self.viewport.pan = Point::new(
+                pad - min_x * self.viewport.zoom,
+                pad - min_y * self.viewport.zoom,
+            );
+        }
     }
 
     /// Recursively create fCoSE nodes from the UI state
@@ -706,6 +735,43 @@ impl GraphLensPanel {
         card.into_any_element()
     }
 
+    fn render_edges(&self, _cx: &Context<Self>) -> AnyElement {
+        let mut edge_coords = Vec::new();
+
+        for (src_id, tgt_id) in &self.dependencies {
+            let src_node = self.nodes.iter().find(|n| n.entry_id == *src_id);
+            let tgt_node = self.nodes.iter().find(|n| n.entry_id == *tgt_id);
+
+            if let (Some(src), Some(tgt)) = (src_node, tgt_node) {
+                let start = self.w2s(
+                    src.world_position
+                        .add(Point::new(src.world_size.x / 2.0, src.world_size.y / 2.0)),
+                );
+                let end = self.w2s(
+                    tgt.world_position
+                        .add(Point::new(tgt.world_size.x / 2.0, tgt.world_size.y / 2.0)),
+                );
+                edge_coords.push((start, end));
+            }
+        }
+
+        gpui::canvas(
+            |_bounds, _window, _app| {},
+            move |_bounds, _state, cx, _app| {
+                for &(start, end) in &edge_coords {
+                    let mut path = gpui::Path::new(start);
+                    path.line_to(end);
+                    cx.paint_path(path, gpui::white());
+                }
+            },
+        )
+        .size_full()
+        .absolute()
+        .top_0()
+        .left_0()
+        .into_any_element()
+    }
+
     /// Collect expanded dirs and leaf nodes into separate lists for z-order rendering.
     fn collect_nodes<'a>(
         nodes: &'a [GraphNode],
@@ -760,45 +826,58 @@ impl Render for GraphLensPanel {
             .map(|n| self.render_leaf_node(n, cx))
             .collect();
 
+        let content = if self.nodes.is_empty() {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(cx.theme().colors().panel_background)
+                .child(Label::new("No visible worktree entries.").color(Color::Muted))
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .relative()
+                .overflow_hidden()
+                .bg(cx.theme().colors().panel_background)
+                .on_scroll_wheel({
+                    let view = view.clone();
+                    move |event, _window, cx| {
+                        view.update(cx, |this, cx| this.on_scroll_wheel(event, cx));
+                    }
+                })
+                .on_mouse_down(MouseButton::Left, {
+                    let view = view.clone();
+                    move |event, _window, cx| {
+                        view.update(cx, |this, cx| this.on_mouse_down(event, cx));
+                    }
+                })
+                .on_mouse_up(MouseButton::Left, {
+                    let view = view.clone();
+                    move |event, _window, cx| {
+                        view.update(cx, |this, cx| this.on_mouse_up(event, cx));
+                    }
+                })
+                .on_mouse_move({
+                    let view = view.clone();
+                    move |event, _window, cx| {
+                        view.update(cx, |this, cx| this.on_mouse_move(event, cx));
+                    }
+                })
+                .child(self.render_edges(cx))
+                .children(expanded_els)
+                .children(leaf_els)
+                .into_any_element()
+        };
+
         div()
             .track_focus(&self.focus_handle)
             .size_full()
             .flex()
             .flex_col()
             .child(toolbar)
-            .child(
-                div()
-                    .flex_1()
-                    .relative()
-                    .overflow_hidden()
-                    .bg(cx.theme().colors().panel_background)
-                    .on_scroll_wheel({
-                        let view = view.clone();
-                        move |event, _window, cx| {
-                            view.update(cx, |this, cx| this.on_scroll_wheel(event, cx));
-                        }
-                    })
-                    .on_mouse_down(MouseButton::Left, {
-                        let view = view.clone();
-                        move |event, _window, cx| {
-                            view.update(cx, |this, cx| this.on_mouse_down(event, cx));
-                        }
-                    })
-                    .on_mouse_up(MouseButton::Left, {
-                        let view = view.clone();
-                        move |event, _window, cx| {
-                            view.update(cx, |this, cx| this.on_mouse_up(event, cx));
-                        }
-                    })
-                    .on_mouse_move({
-                        let view = view.clone();
-                        move |event, _window, cx| {
-                            view.update(cx, |this, cx| this.on_mouse_move(event, cx));
-                        }
-                    })
-                    .children(expanded_els)
-                    .children(leaf_els),
-            )
+            .child(content)
     }
 }
 

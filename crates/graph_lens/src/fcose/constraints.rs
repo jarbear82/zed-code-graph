@@ -642,3 +642,33 @@ impl<'g> ConstraintPhase<'g> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::math::Vector2;
+    use super::*;
+
+    #[test]
+    fn test_procrustes_identity() {
+        let src = vec![Vector2::new(1.0, 1.0), Vector2::new(2.0, 2.0)];
+        let tgt = vec![Vector2::new(1.0, 1.0), Vector2::new(2.0, 2.0)];
+        let result = ConstraintPhase::procrustes(&src, &tgt);
+        assert!(result.is_some());
+        let t = result.unwrap();
+        // Should return an identity-like transformation (rotation ~ 0)
+        assert!((t[0][0] - 1.0).abs() < 1e-4);
+        assert!((t[0][1] - 0.0).abs() < 1e-4);
+        assert!((t[1][0] - 0.0).abs() < 1e-4);
+        assert!((t[1][1] - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_longest_path_distances() {
+        let edges = vec![(NodeId(0), NodeId(1), 5.0), (NodeId(1), NodeId(2), 3.0)];
+        let nodes = vec![NodeId(0), NodeId(1), NodeId(2)];
+        let dists = ConstraintPhase::longest_path_distances(&edges, &nodes);
+        assert!((dists[&NodeId(0)] - 0.0).abs() < 1e-4);
+        assert!((dists[&NodeId(1)] - 5.0).abs() < 1e-4);
+        assert!((dists[&NodeId(2)] - 8.0).abs() < 1e-4);
+    }
+}
