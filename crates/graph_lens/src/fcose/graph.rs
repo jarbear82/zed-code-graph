@@ -4,6 +4,25 @@ use hashbrown::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u32);
 
+#[derive(Debug, Clone, Copy)]
+pub struct Padding {
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+    pub left: f64,
+}
+
+impl Padding {
+    pub fn uniform(val: f64) -> Self {
+        Self {
+            top: val,
+            right: val,
+            bottom: val,
+            left: val,
+        }
+    }
+}
+
 /// Reserved base for dummy NodeIds created during spectral preprocessing (§4.1.1).
 /// These IDs are local to SpectralLayout and never inserted into CompoundGraph.
 pub const DUMMY_ID_BASE: u32 = 0xFFFF_0000;
@@ -173,16 +192,19 @@ impl CompoundGraph {
     ///
     /// FIX: the center is (min+max)/2 regardless of padding — padding only
     /// widens the bounding box, it does not shift the center.
-    pub fn update_compound_bounds(&mut self, id: NodeId, padding: f64) {
+    // Replace everything from line 147 downwards with exactly this:
+    pub fn update_compound_bounds(&mut self, id: NodeId, padding: &Padding) {
         let children: Vec<NodeId> = self.node(id).children.clone();
         if children.is_empty() {
             return;
         }
 
-        let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
-        let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut min_x = f64::MAX;
+        let mut min_y = f64::MAX;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
 
-        for &cid in &children {
+        for cid in children {
             let bb = self.node(cid).aabb();
             min_x = min_x.min(bb[0]);
             min_y = min_y.min(bb[1]);
@@ -191,9 +213,14 @@ impl CompoundGraph {
         }
 
         let n = self.node_mut(id);
-        // Center of [min - padding, max + padding] is still (min + max) / 2.
-        n.pos = Vector2::new((min_x + max_x) * 0.5, (min_y + max_y) * 0.5);
-        n.width = (max_x - min_x) + padding * 2.0;
-        n.height = (max_y - min_y) + padding * 2.0;
+
+        n.width = (max_x - min_x) + padding.left + padding.right;
+        n.height = (max_y - min_y) + padding.top + padding.bottom;
+
+        let content_center_x = (min_x + max_x) / 2.0;
+        let content_center_y = (min_y + max_y) / 2.0;
+
+        n.pos.x = content_center_x + (padding.right - padding.left) / 2.0;
+        n.pos.y = content_center_y + (padding.bottom - padding.top) / 2.0;
     }
 }

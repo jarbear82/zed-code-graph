@@ -132,6 +132,7 @@ impl PhysicsEngine {
         fixed: &[FixedConstraint],
         alignment: &[AlignmentConstraint],
         relative: &[RelativeConstraint],
+        padding: &super::graph::Padding,
     ) {
         if graph.nodes.len() != self.last_node_count {
             self.rebuild_tree(graph);
@@ -237,7 +238,6 @@ impl PhysicsEngine {
             .collect();
         compound_depths.sort_by(|a, b| b.1.cmp(&a.1));
 
-        let padding = self.compound_padding;
         for (id, _) in compound_depths {
             graph.update_compound_bounds(id, padding);
         }

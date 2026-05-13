@@ -301,41 +301,33 @@ impl GraphLensPanel {
         }
     }
 
+    // In graph_lens/src/lib.rs
     fn layout(&mut self) {
         if self.nodes.is_empty() {
             return;
         }
 
         let mut cg = CompoundGraph::new();
-        let mut entry_to_node = HashMap::new();
-        let mut node_counter = 0u32;
+        let mut map = HashMap::default();
+        let mut counter = 0;
+        self.build_fcose_nodes(&self.nodes, None, &mut cg, &mut map, &mut counter);
 
-        // Step 1: Flatten the tree and build fCoSE nodes
-        self.build_fcose_nodes(
-            &self.nodes,
-            None,
-            &mut cg,
-            &mut entry_to_node,
-            &mut node_counter,
-        );
+        // 1. Create the Asymmetrical padding
+        // Add visual clearance for the header text based on your UI config
+        let z = self.viewport.zoom;
+        let header_height = (self.config.header_height * z) as f64;
 
-        // Step 2: Add Adjacency Edges!
-        // Loop through the dependencies we saved in our panel state
-        for (source_entry_id, target_entry_id) in &self.dependencies {
-            // Only add the edge if BOTH files are currently visible in the graph
-            if let (Some(&fcose_source), Some(&fcose_target)) = (
-                entry_to_node.get(source_entry_id),
-                entry_to_node.get(target_entry_id),
-            ) {
-                cg.add_edge(fcose_source, fcose_target);
-            }
-        }
+        let compound_padding = fcose::graph::Padding {
+            top: header_height + 10.0, // Header height + 10px visual clearance
+            right: 10.0,
+            bottom: 10.0,
+            left: 10.0,
+        };
 
-        // Step 3: Run the fCoSE layout engine
-        run_layout(&mut cg, &[], &[], &[], 100);
+        // 2. Pass it to the layout engine
+        run_layout(&mut cg, &[], &[], &[], 100, &compound_padding);
 
-        // Step 4: Map the computed positions back to GPUI world coordinates
-        Self::apply_fcose_positions(&mut self.nodes, &cg, &entry_to_node);
+        Self::apply_fcose_positions(&mut self.nodes, &cg, &map);
         self.center_view();
     }
 

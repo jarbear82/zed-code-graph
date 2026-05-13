@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 pub struct SpectralLayout;
 
 impl SpectralLayout {
-    pub fn apply(graph: &mut CompoundGraph) {
+    pub fn apply(graph: &mut CompoundGraph, padding: &super::graph::Padding) {
         let mut dummy_ctr = 0u32;
         let (flat_nodes, flat_edges, dummy_ids) = Self::preprocess(graph, &mut dummy_ctr);
         let positions = Self::ssde(&flat_nodes, &flat_edges);
@@ -31,7 +31,7 @@ impl SpectralLayout {
             }
         }
 
-        Self::restore_compound_positions(graph);
+        Self::restore_compound_positions(graph, padding);
     }
 
     // -----------------------------------------------------------------------
@@ -348,7 +348,7 @@ impl SpectralLayout {
     // §4.1.3  Postprocessing
     // -----------------------------------------------------------------------
 
-    fn restore_compound_positions(graph: &mut CompoundGraph) {
+    fn restore_compound_positions(graph: &mut CompoundGraph, padding: &super::graph::Padding) {
         let mut ids_depths: Vec<(NodeId, usize)> = graph
             .nodes
             .iter()
@@ -358,7 +358,7 @@ impl SpectralLayout {
         ids_depths.sort_by(|a, b| b.1.cmp(&a.1));
 
         for (id, _) in ids_depths {
-            graph.update_compound_bounds(id, 10.0);
+            graph.update_compound_bounds(id, padding);
         }
     }
 

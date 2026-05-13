@@ -22,9 +22,10 @@ pub fn run_layout(
     alignment: &[AlignmentConstraint],
     relative: &[RelativeConstraint],
     max_iter: usize,
+    padding: &graph::Padding,
 ) {
     // Phase I — spectral draft layout.
-    SpectralLayout::apply(graph);
+    SpectralLayout::apply(graph, padding);
 
     // Phase II — transformation and constraint enforcement.
     ConstraintPhase {
@@ -44,6 +45,6 @@ pub fn run_layout(
         if engine.temperature < 1e-3 {
             break;
         }
-        engine.tick(graph, &layout_state, fixed, alignment, relative);
+        engine.tick(graph, &layout_state, fixed, alignment, relative, padding); // <--- Pass here    }
     }
 }
