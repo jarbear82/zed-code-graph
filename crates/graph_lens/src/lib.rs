@@ -1,8 +1,8 @@
 use editor::Editor;
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyContext, ParentElement, Render, Styled, Subscription, Task, UniformListScrollHandle, Window,
-    actions, div, px, uniform_list,
+    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyContext, ParentElement, Render, Styled, Subscription, Task,
+    UniformListScrollHandle, Window, actions, div, px, uniform_list,
 };
 use language::{Anchor, BufferId, OutlineItem};
 use project::{File, Project, ProjectEntryId, ProjectPath, WorktreeId};
@@ -19,6 +19,7 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
     item::ItemHandle,
 };
+use worktree::Snapshot;
 
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
 const GRAPH_LENS_PANEL_KEY: &str = "graph_lens_panel";
@@ -41,10 +42,169 @@ actions!(
     ]
 );
 
+pub trait OutlineProvider: Send + Sync {
+    fn fetch_outlines(
+        &self,
+        buffer_id: BufferId,
+        cx: &mut App,
+    ) -> Option<Task<Vec<OutlineItem<Anchor>>>>;
+}
+
+pub struct EditorOutlineProvider {
+    editor: gpui::WeakEntity<Editor>,
+}
+
+impl OutlineProvider for EditorOutlineProvider {
+    fn fetch_outlines(
+        &self,
+        buffer_id: BufferId,
+        cx: &mut App,
+    ) -> Option<Task<Vec<OutlineItem<Anchor>>>> {
+        self.editor
+            .upgrade()
+            .map(|e| e.update(cx, |editor, cx| editor.buffer_outline_items(buffer_id, cx)))
+    }
+}
+
+pub struct TreeBuilder;
+
+impl TreeBuilder {
+    pub fn build(
+        visible_worktrees: Vec<(WorktreeId, worktree::Snapshot)>,
+        open_files: HashMap<ProjectEntryId, BufferId>,
+        open_outlines: HashMap<ProjectEntryId, Vec<OutlineItem<Anchor>>>,
+        expanded_dirs: HashSet<(WorktreeId, ProjectEntryId)>,
+        expanded_files: HashSet<(WorktreeId, ProjectEntryId)>,
+    ) -> (Vec<CachedEntry>, SharedString) {
+        let mut entries = Vec::new();
+        let mut current_id = 0;
+        let mut project_title = String::new();
+
+        for (worktree_id, snapshot) in visible_worktrees {
+            if let Some(root) = snapshot.root_entry() {
+                if project_title.is_empty() {
+                    project_title = root.path.file_name().unwrap_or_default().to_string();
+                }
+
+                let mut children: Vec<_> = snapshot.child_entries(&root.path).cloned().collect();
+                children.reverse();
+
+                let mut stack = Vec::new();
+                for child in children {
+                    stack.push((child, 0));
+                }
+
+                while let Some((entry, depth)) = stack.pop() {
+                    let is_dir = entry.is_dir();
+                    let is_open = !is_dir && open_files.contains_key(&entry.id);
+
+                    let is_expanded = if is_dir {
+                        expanded_dirs.contains(&(worktree_id, entry.id))
+                    } else {
+                        is_open && expanded_files.contains(&(worktree_id, entry.id))
+                    };
+
+                    let kind = if is_dir {
+                        LensEntryKind::Dir
+                    } else {
+                        LensEntryKind::File
+                    };
+
+                    let name =
+                        SharedString::from(entry.path.file_name().unwrap_or_default().to_string());
+
+                    entries.push(CachedEntry {
+                        id: current_id,
+                        worktree_id,
+                        entry_id: Some(entry.id),
+                        path: entry.path.clone(),
+                        kind: kind.clone(),
+                        name,
+                        depth,
+                        is_expanded,
+                        is_open,
+                    });
+                    current_id += 1;
+
+                    if is_expanded {
+                        if is_dir {
+                            let mut children: Vec<_> =
+                                snapshot.child_entries(&entry.path).cloned().collect();
+                            children.reverse();
+                            for child in children {
+                                stack.push((child, depth + 1));
+                            }
+                        } else if is_open {
+                            // Inject outline elements
+                            if let Some(outlines) = open_outlines.get(&entry.id) {
+                                for outline in outlines {
+                                    let symbol_name = SharedString::from(outline.text.clone());
+                                    entries.push(CachedEntry {
+                                        id: current_id,
+                                        worktree_id,
+                                        entry_id: None,
+                                        path: entry.path.clone(),
+                                        kind: LensEntryKind::Outline(symbol_name.clone()),
+                                        name: symbol_name,
+                                        depth: depth + 1 + outline.depth,
+                                        is_expanded: false,
+                                        is_open: false,
+                                    });
+                                    current_id += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if project_title.is_empty() {
+            project_title = "Workspace".to_string();
+        }
+
+        (entries, SharedString::from(project_title))
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum LensEntryKind {
+    Dir,
+    File,
+    Outline(SharedString),
+}
+
+#[derive(Clone)]
+pub struct CachedEntry {
+    pub id: usize,
+    pub worktree_id: WorktreeId,
+    pub entry_id: Option<ProjectEntryId>,
+    pub path: Arc<RelPath>,
+    pub kind: LensEntryKind,
+    pub name: SharedString,
+    pub depth: usize,
+    pub is_expanded: bool,
+    pub is_open: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ActiveTab {
+    List,
+    Graph,
+}
+
+struct State {
+    project_name: SharedString,
+    entries: Vec<CachedEntry>,
+    expanded_dirs: HashSet<(WorktreeId, ProjectEntryId)>,
+    expanded_files: HashSet<(WorktreeId, ProjectEntryId)>,
+    selected_index: Option<usize>,
+    active_tab: ActiveTab,
+}
+
 pub fn init(cx: &mut App) {
     cx.observe_new(
         |workspace: &mut Workspace, window: Option<&mut Window>, cx: &mut Context<Workspace>| {
-            // 1. Core Panel Toggles (Shared across Outline & Project)
             workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
                 workspace.toggle_panel_focus::<GraphLensPanel>(window, cx);
             });
@@ -55,7 +215,6 @@ pub fn init(cx: &mut App) {
                 }
             });
 
-            // 2. Tree Manipulation Actions
             workspace.register_action(|workspace, action: &CollapseAllEntries, window, cx| {
                 if let Some(panel) = workspace.panel::<GraphLensPanel>(cx) {
                     panel.update(cx, |panel, cx| {
@@ -64,7 +223,6 @@ pub fn init(cx: &mut App) {
                 }
             });
 
-            // 3. File System / Node Mutations (Inherited from ProjectPanel)
             workspace.register_action(|workspace, action: &Rename, window, cx| {
                 workspace.open_panel::<GraphLensPanel>(window, cx);
                 if let Some(panel) = workspace.panel::<GraphLensPanel>(cx) {
@@ -92,7 +250,6 @@ pub fn init(cx: &mut App) {
                 }
             });
 
-            // 4. View Configuration Actions
             workspace.register_action(|workspace, _: &ToggleHideGitIgnore, _, cx| {
                 let fs = workspace.app_state().fs.clone();
                 settings::update_settings_file(fs, cx, move |setting, _| {
@@ -128,38 +285,10 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub enum LensEntryKind {
-    Dir,
-    File,
-    Outline(SharedString),
-}
-
-#[derive(Clone)]
-pub struct CachedEntry {
-    pub id: usize,
-    pub worktree_id: WorktreeId,
-    pub entry_id: Option<ProjectEntryId>,
-    pub path: Arc<RelPath>,
-    pub kind: LensEntryKind,
-    pub name: SharedString,
-    pub depth: usize,
-    pub is_expanded: bool,
-    pub is_open: bool,
-}
-
-struct State {
-    project_name: SharedString,
-    entries: Vec<CachedEntry>,
-    expanded_dirs: HashSet<(WorktreeId, ProjectEntryId)>,
-    expanded_files: HashSet<(WorktreeId, ProjectEntryId)>,
-    selected_index: Option<usize>,
-}
-
 pub struct GraphLensPanel {
     project: Entity<Project>,
     workspace: gpui::WeakEntity<Workspace>,
-    active_editor: Option<gpui::WeakEntity<Editor>>,
+    outline_provider: Option<Arc<dyn OutlineProvider>>,
     focus_handle: FocusHandle,
     scroll_handle: UniformListScrollHandle,
     state: State,
@@ -179,13 +308,11 @@ impl GraphLensPanel {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
 
-            // 1. Focus Subscription
             let focus_subscription =
                 cx.on_focus(&focus_handle, window, |_: &mut Self, _window, cx| {
                     cx.notify()
                 });
 
-            // 2. Workspace Subscription (Outline Paradigm)
             let workspace_subscription = cx.subscribe_in(
                 &workspace_handle.upgrade().expect("Workspace must exist"),
                 window,
@@ -208,7 +335,6 @@ impl GraphLensPanel {
                 },
             );
 
-            // 3. Project Subscription (Project Explorer Paradigm)
             let project_subscription = cx.subscribe_in(
                 &project,
                 window,
@@ -240,16 +366,14 @@ impl GraphLensPanel {
                 },
             );
 
-            // 4. Global UI Subscriptions (Icons and Settings)
             let icons_subscription = cx.observe_global::<file_icons::FileIcons>(|_, cx| {
                 cx.notify();
             });
 
-            // Initialize the State & Entity
             let mut lens_panel = Self {
                 project: project.clone(),
                 workspace: workspace_handle,
-                active_editor: None,
+                outline_provider: None,
                 focus_handle,
                 scroll_handle: UniformListScrollHandle::new(),
 
@@ -259,6 +383,7 @@ impl GraphLensPanel {
                     expanded_dirs: HashSet::new(),
                     expanded_files: HashSet::new(),
                     selected_index: None,
+                    active_tab: ActiveTab::List,
                 },
 
                 update_task: None,
@@ -270,7 +395,6 @@ impl GraphLensPanel {
                 ],
             };
 
-            // 5. Initial Bootstrapping
             lens_panel.update_entries(None, window, cx);
 
             if let Some((item, editor)) = workspace_active_editor(workspace, cx) {
@@ -281,6 +405,13 @@ impl GraphLensPanel {
         })
     }
 
+    fn set_tab(&mut self, tab: ActiveTab, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.active_tab != tab {
+            self.state.active_tab = tab;
+            cx.notify();
+        }
+    }
+
     fn replace_active_editor(
         &mut self,
         _item: Box<dyn ItemHandle>,
@@ -288,12 +419,14 @@ impl GraphLensPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.active_editor = Some(editor.downgrade());
+        self.outline_provider = Some(Arc::new(EditorOutlineProvider {
+            editor: editor.downgrade(),
+        }));
         self.update_entries(Some(UPDATE_DEBOUNCE), _window, cx);
     }
 
     fn clear_active_editor(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.active_editor = None;
+        self.outline_provider = None;
         self.state.expanded_files.clear();
         self.update_entries(None, _window, cx);
     }
@@ -304,7 +437,7 @@ impl GraphLensPanel {
         _entry_id: ProjectEntryId,
         _cx: &mut Context<Self>,
     ) {
-        // Implementation for deep tree expansion goes here
+        // TODO: Implementation for deep tree expansion goes here
     }
 
     pub fn collapse_all_entries(
@@ -319,17 +452,9 @@ impl GraphLensPanel {
         cx.notify();
     }
 
-    pub fn rename(&mut self, _: &Rename, _window: &mut Window, _cx: &mut Context<Self>) {
-        // Delegate to inline editor state
-    }
-
-    pub fn duplicate(&mut self, _: &Duplicate, _window: &mut Window, _cx: &mut Context<Self>) {
-        // Delegate to underlying project commands
-    }
-
-    pub fn delete(&mut self, _: &Delete, _window: &mut Window, _cx: &mut Context<Self>) {
-        // Delegate to underlying project commands
-    }
+    pub fn rename(&mut self, _: &Rename, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn duplicate(&mut self, _: &Duplicate, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn delete(&mut self, _: &Delete, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     fn update_entries(
         &mut self,
@@ -346,7 +471,6 @@ impl GraphLensPanel {
             })
             .collect();
 
-        // 1. Gather all currently open files
         let open_files: HashMap<ProjectEntryId, BufferId> = project
             .buffer_store()
             .read(cx)
@@ -357,12 +481,12 @@ impl GraphLensPanel {
             })
             .collect();
 
-        // 2. Start fetching outlines for these buffers via the active editor
         let mut outline_tasks = HashMap::new();
-        if let Some(editor) = self.active_editor.as_ref().and_then(|e| e.upgrade()) {
+        if let Some(provider) = &self.outline_provider {
             for (&entry_id, &buffer_id) in &open_files {
-                let task = editor.update(cx, |e, cx| e.buffer_outline_items(buffer_id, cx));
-                outline_tasks.insert(entry_id, task);
+                if let Some(task) = provider.fetch_outlines(buffer_id, cx) {
+                    outline_tasks.insert(entry_id, task);
+                }
             }
         }
 
@@ -374,111 +498,22 @@ impl GraphLensPanel {
                 cx.background_executor().timer(duration).await;
             }
 
-            // 3. Await all outline tasks in the background
             let mut open_outlines: HashMap<ProjectEntryId, Vec<OutlineItem<Anchor>>> =
                 HashMap::new();
             for (entry_id, task) in outline_tasks {
                 open_outlines.insert(entry_id, task.await);
             }
 
-            // 4. Build the tree
             let (new_entries, new_title) = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut entries = Vec::new();
-                    let mut current_id = 0;
-                    let mut project_title = String::new();
-
-                    for (worktree_id, snapshot) in visible_worktrees {
-                        if let Some(root) = snapshot.root_entry() {
-                            if project_title.is_empty() {
-                                project_title =
-                                    root.path.file_name().unwrap_or_default().to_string();
-                            }
-
-                            let mut children: Vec<_> =
-                                snapshot.child_entries(&root.path).cloned().collect();
-                            children.reverse();
-
-                            let mut stack = Vec::new();
-                            for child in children {
-                                stack.push((child, 0));
-                            }
-
-                            while let Some((entry, depth)) = stack.pop() {
-                                let is_dir = entry.is_dir();
-                                let is_open = !is_dir && open_files.contains_key(&entry.id);
-
-                                let is_expanded = if is_dir {
-                                    expanded_dirs.contains(&(worktree_id, entry.id))
-                                } else {
-                                    is_open && expanded_files.contains(&(worktree_id, entry.id))
-                                };
-
-                                let kind = if is_dir {
-                                    LensEntryKind::Dir
-                                } else {
-                                    LensEntryKind::File
-                                };
-
-                                let name = SharedString::from(
-                                    entry.path.file_name().unwrap_or_default().to_string(),
-                                );
-
-                                entries.push(CachedEntry {
-                                    id: current_id,
-                                    worktree_id,
-                                    entry_id: Some(entry.id),
-                                    path: entry.path.clone(),
-                                    kind: kind.clone(),
-                                    name,
-                                    depth,
-                                    is_expanded,
-                                    is_open,
-                                });
-                                current_id += 1;
-
-                                if is_expanded {
-                                    if is_dir {
-                                        let mut children: Vec<_> =
-                                            snapshot.child_entries(&entry.path).cloned().collect();
-                                        children.reverse();
-                                        for child in children {
-                                            stack.push((child, depth + 1));
-                                        }
-                                    } else if is_open {
-                                        // 5. Inject the actual outline elements instead of a dummy node
-                                        if let Some(outlines) = open_outlines.get(&entry.id) {
-                                            for outline in outlines {
-                                                let symbol_name =
-                                                    SharedString::from(outline.text.clone());
-                                                entries.push(CachedEntry {
-                                                    id: current_id,
-                                                    worktree_id,
-                                                    entry_id: None,
-                                                    path: entry.path.clone(),
-                                                    kind: LensEntryKind::Outline(
-                                                        symbol_name.clone(),
-                                                    ),
-                                                    name: symbol_name,
-                                                    depth: depth + 1 + outline.depth,
-                                                    is_expanded: false,
-                                                    is_open: false,
-                                                });
-                                                current_id += 1;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if project_title.is_empty() {
-                        project_title = "Workspace".to_string();
-                    }
-
-                    (entries, SharedString::from(project_title))
+                    TreeBuilder::build(
+                        visible_worktrees,
+                        open_files,
+                        open_outlines,
+                        expanded_dirs,
+                        expanded_files,
+                    )
                 })
                 .await;
 
@@ -490,7 +525,6 @@ impl GraphLensPanel {
                     this.state.selected_index =
                         Some(idx.min(this.state.entries.len().saturating_sub(1)));
                 }
-
                 cx.notify();
             })
             .log_err();
@@ -532,7 +566,6 @@ impl GraphLensPanel {
             }
             LensEntryKind::File => {
                 if entry.is_open {
-                    // IF OPEN: Toggle its outline children
                     if entry.is_expanded {
                         self.state
                             .expanded_files
@@ -543,7 +576,6 @@ impl GraphLensPanel {
                             .insert((entry.worktree_id, entry_id));
                     }
                 } else {
-                    // IF CLOSED: Open it in the editor
                     if let Some(workspace) = self.workspace.upgrade() {
                         workspace.update(cx, |ws, cx| {
                             ws.open_path_preview(
@@ -552,9 +584,9 @@ impl GraphLensPanel {
                                     path: entry.path.clone(),
                                 },
                                 None,
-                                true,  // Focus the opened item
-                                false, // Not a preview
-                                true,  // Make visible
+                                true,
+                                false,
+                                true,
                                 window,
                                 cx,
                             )
@@ -563,9 +595,8 @@ impl GraphLensPanel {
                     }
                 }
             }
-            LensEntryKind::Outline(_) => return, // Handle clicking an outline node if desired
+            LensEntryKind::Outline(_) => return,
         }
-
         self.update_entries(None, window, cx);
     }
 
@@ -607,6 +638,187 @@ impl GraphLensPanel {
         }
         dispatch_context
     }
+
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w_full()
+            .px_3()
+            .py_2()
+            .bg(cx.theme().colors().background)
+            .border_b_1()
+            .border_color(gpui::rgba(0x333333ff))
+            .child(Label::new(format!("Project: {}", self.state.project_name)))
+    }
+
+    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_row()
+            .w_full()
+            .border_b_1()
+            .border_color(gpui::rgba(0x333333ff))
+            .child(self.render_tab("List", ActiveTab::List, cx))
+            .child(self.render_tab("Graph", ActiveTab::Graph, cx))
+    }
+
+    fn render_tab(
+        &self,
+        title: &'static str,
+        tab: ActiveTab,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_active = self.state.active_tab == tab;
+        div()
+            .id(title)
+            .cursor_pointer()
+            .px_4()
+            .py_1()
+            .bg(if is_active {
+                gpui::rgba(0x444444ff)
+            } else {
+                gpui::rgba(0x00000000)
+            })
+            .on_click(cx.listener(move |this, _, window, cx| this.set_tab(tab, window, cx)))
+            .child(Label::new(title))
+    }
+
+    fn render_content(
+        &self,
+        is_focused: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        match self.state.active_tab {
+            ActiveTab::List => self.render_list_view(is_focused, cx).into_any_element(),
+            ActiveTab::Graph => self.render_graph_view(cx).into_any_element(),
+        }
+    }
+
+    fn render_list_view(&self, is_focused: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        uniform_list(
+            "graph_lens_entries",
+            self.state.entries.len(),
+            // RESTORED: cx.processor wrapper and the 4-argument signature
+            cx.processor(move |this, range, _window, cx| {
+                let mut items = Vec::new();
+                for ix in range {
+                    let Some(entry) = this.state.entries.get(ix) else {
+                        continue;
+                    };
+
+                    let is_selected = this.state.selected_index == Some(ix);
+                    let indent = px((entry.depth * 16) as f32);
+
+                    let (icon, icon_color) = match &entry.kind {
+                        LensEntryKind::Dir => {
+                            if entry.is_expanded {
+                                (IconName::FolderOpen, Color::Muted)
+                            } else {
+                                (IconName::Folder, Color::Muted)
+                            }
+                        }
+                        LensEntryKind::File => (IconName::File, Color::Default),
+                        LensEntryKind::Outline(_) => (IconName::Code, Color::Accent),
+                    };
+
+                    let element = div()
+                        .id(entry.id)
+                        .pl(indent)
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .when(is_selected && is_focused, |s| s.bg(gpui::rgba(0x444444ff)))
+                        .when(is_selected && !is_focused, |s| s.bg(gpui::rgba(0x222222ff)))
+                        .when(!is_selected, |s| s.hover(|s| s.bg(gpui::rgba(0x333333ff))))
+                        .on_click(cx.listener({
+                            let idx = ix;
+                            move |this, _, window, cx| {
+                                this.state.selected_index = Some(idx);
+                                this.toggle_expanded_state(&ToggleExpanded, window, cx);
+                            }
+                        }))
+                        .child(Icon::new(icon).color(icon_color).size(IconSize::Small))
+                        .child(Label::new(entry.name.clone()).single_line());
+
+                    items.push(element.into_any_element());
+                }
+                items
+            }),
+        )
+        .track_scroll(&self.scroll_handle)
+        .flex_1()
+    }
+
+    fn render_graph_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex_1()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(div().flex_1().size_full().child(gpui::canvas(
+                |_bounds, _window, _cx| (),
+                |_state, _bounds, _window, _cx| {
+                    // TODO: Implement GPUI Canvas drawing logic here
+                },
+            )))
+            .child(
+                div()
+                    .w_full()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(gpui::rgba(0x333333ff))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(self.render_graph_button("btn-zoom-in", "Zoom In", cx))
+                            .child(self.render_graph_button("btn-zoom-out", "Zoom Out", cx))
+                            .child(self.render_graph_button("btn-zoom-fit", "Zoom to Fit", cx)),
+                    )
+                    .child(
+                        div()
+                            .id("btn-run-layout")
+                            .cursor_pointer()
+                            .px_3()
+                            .py_1()
+                            .bg(cx.theme().colors().element_background)
+                            .hover(|s| s.opacity(0.8))
+                            .rounded_md()
+                            .on_click(cx.listener(|_, _, _, _| println!("Run Layout clicked")))
+                            .child(Label::new("Run Layout")),
+                    ),
+            )
+    }
+
+    fn render_graph_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .cursor_pointer()
+            .px_2()
+            .py_1()
+            .bg(cx.theme().colors().element_background)
+            .hover(|s| s.opacity(0.8))
+            .rounded_md()
+            .on_click(cx.listener(move |_, _, _, _| println!("{} clicked", label)))
+            .child(Label::new(label))
+    }
 }
 
 impl EventEmitter<PanelEvent> for GraphLensPanel {}
@@ -631,74 +843,9 @@ impl Render for GraphLensPanel {
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::toggle_expanded_state))
-            // --- NEW TITLE BAR ---
-            .child(
-                div()
-                    .w_full()
-                    .px_3()
-                    .py_2()
-                    .bg(cx.theme().colors().background) // subtle background for the header
-                    .border_b_1()
-                    .border_color(gpui::rgba(0x333333ff)) // subtle border
-                    .child(Label::new(format!("Project: {}", self.state.project_name))),
-            )
-            // ---------------------
-            .child(
-                uniform_list("graph_lens_entries", self.state.entries.len(), {
-                    cx.processor(move |this, range, _window, cx| {
-                        let mut items = Vec::new();
-                        for ix in range {
-                            let Some(entry) = this.state.entries.get(ix) else {
-                                continue;
-                            };
-
-                            let is_selected = this.state.selected_index == Some(ix);
-                            let indent = px((entry.depth * 16) as f32);
-
-                            let (icon, icon_color) = match &entry.kind {
-                                LensEntryKind::Dir => {
-                                    if entry.is_expanded {
-                                        (IconName::FolderOpen, Color::Muted)
-                                    } else {
-                                        (IconName::Folder, Color::Muted)
-                                    }
-                                }
-                                LensEntryKind::File => (IconName::File, Color::Default),
-                                LensEntryKind::Outline(_) => (IconName::Code, Color::Accent),
-                            };
-
-                            let element = div()
-                                .id(entry.id)
-                                .pl(indent)
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_1()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .when(is_selected && is_focused, |s| s.bg(gpui::rgba(0x444444ff)))
-                                .when(is_selected && !is_focused, |s| s.bg(gpui::rgba(0x222222ff)))
-                                .when(!is_selected, |s| s.hover(|s| s.bg(gpui::rgba(0x333333ff))))
-                                .on_click(cx.listener({
-                                    let idx = ix;
-                                    move |this, _, window, cx| {
-                                        this.state.selected_index = Some(idx);
-                                        this.toggle_expanded_state(&ToggleExpanded, window, cx);
-                                    }
-                                }))
-                                .child(Icon::new(icon).color(icon_color).size(IconSize::Small))
-                                .child(Label::new(entry.name.clone()).single_line());
-
-                            items.push(element.into_any_element());
-                        }
-                        items
-                    })
-                })
-                .track_scroll(&self.scroll_handle)
-                .flex_1(),
-            )
+            .child(self.render_header(cx))
+            .child(self.render_tab_bar(cx))
+            .child(self.render_content(is_focused, window, cx))
     }
 }
 
