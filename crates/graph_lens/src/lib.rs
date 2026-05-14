@@ -29,7 +29,9 @@ mod graph_engine;
 mod layout_fruchterman_reingold;
 mod quadtree;
 
-use canvas_utils::{to_logical_pt, to_screen_pt, visible_logical_bounds};
+use canvas_utils::{
+    to_global_screen_pt, to_local_screen_pt, to_logical_pt, visible_logical_bounds,
+};
 use constants::*;
 
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
@@ -863,8 +865,8 @@ impl GraphLensPanel {
                     let new_size = bounds.size;
 
                     window.on_next_frame(move |_window, cx| {
-                        // Fix: Added _window and cx arguments
                         view_handle.update(cx, |this, cx| {
+                            // This automatically captures the current panel size/pos from the layout engine
                             if this.state.viewport_origin != new_origin
                                 || this.state.viewport_size != new_size
                             {
@@ -891,8 +893,8 @@ impl GraphLensPanel {
                                 y: n2.position.y + n2.size.height / 2.0,
                             };
 
-                            let screen1 = to_screen_pt(center1, bounds.origin, zoom, pan);
-                            let screen2 = to_screen_pt(center2, bounds.origin, zoom, pan);
+                            let screen1 = to_global_screen_pt(center1, bounds.origin, zoom, pan);
+                            let screen2 = to_global_screen_pt(center2, bounds.origin, zoom, pan);
 
                             let mut path = gpui::Path::new(screen1);
                             path.line_to(screen2);
@@ -915,7 +917,7 @@ impl GraphLensPanel {
             };
 
             if viewport_bounds.intersects(&node_bounds) {
-                let screen_pt = to_screen_pt(node.position, viewport_origin, zoom, pan);
+                let screen_pt = to_local_screen_pt(node.position, zoom, pan);
                 let screen_w = px(node.size.width * zoom);
                 let screen_h = px(node.size.height * zoom);
 
@@ -1050,6 +1052,20 @@ impl GraphLensPanel {
                     )
                     .child(
                         div()
+                            .id("btn-zoom-fit")
+                            .cursor_pointer()
+                            .px_2()
+                            .py_1()
+                            .bg(cx.theme().colors().element_background)
+                            .hover(|s| s.opacity(0.8))
+                            .rounded_md()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.zoom_to_fit(window, cx);
+                            }))
+                            .child(Label::new("Zoom to Fit")),
+                    )
+                    .child(
+                        div()
                             .id("btn-run-layout")
                             .cursor_pointer()
                             .px_3()
@@ -1063,6 +1079,60 @@ impl GraphLensPanel {
                             .child(Label::new("Run Layout")),
                     ),
             )
+    }
+
+    // src/lib.rs -> impl GraphLensPanel
+
+    fn zoom_to_fit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let active_ids = &self.state.graph_engine.active_nodes;
+        if active_ids.is_empty() {
+            return;
+        }
+
+        // 1. Calculate Graph Bounds
+        let mut min = Point {
+            x: f32::MAX,
+            y: f32::MAX,
+        };
+        let mut max = Point {
+            x: f32::MIN,
+            y: f32::MIN,
+        };
+
+        for &id in active_ids {
+            let node = &self.state.graph_engine.nodes[id.0];
+            min.x = min.x.min(node.position.x);
+            min.y = min.y.min(node.position.y);
+            max.x = max.x.max(node.position.x + node.size.width);
+            max.y = max.y.max(node.position.y + node.size.height);
+        }
+
+        let graph_size = Size {
+            width: max.x - min.x,
+            height: max.y - min.y,
+        };
+        let view_w: f32 = self.state.viewport_size.width.into();
+        let view_h: f32 = self.state.viewport_size.height.into();
+
+        // 2. Calculate New Zoom
+        let padding = 0.85; // 15% margin
+        let zoom_x = (view_w / graph_size.width.max(1.0)) * padding;
+        let zoom_y = (view_h / graph_size.height.max(1.0)) * padding;
+        self.state.zoom = zoom_x.min(zoom_y).clamp(0.1, 5.0);
+
+        // 3. Center the Canvas
+        // Formula: Pan = (ViewportCenter) - (GraphCenter * Zoom)
+        let graph_center_logical = Point {
+            x: min.x + graph_size.width / 2.0,
+            y: min.y + graph_size.height / 2.0,
+        };
+
+        self.state.pan = Point {
+            x: (view_w / 2.0) - (graph_center_logical.x * self.state.zoom),
+            y: (view_h / 2.0) - (graph_center_logical.y * self.state.zoom),
+        };
+
+        cx.notify();
     }
 }
 

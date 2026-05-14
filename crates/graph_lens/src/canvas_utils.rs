@@ -1,33 +1,29 @@
-use gpui::{Pixels, Point, px};
+use gpui::{Bounds, Pixels, Point, Size, px};
 
-/// Converts a logical canvas coordinate (from GraphEngine) to a screen-space point.
-///
-/// This is used to accurately place GPUI elements (`div().absolute()`) over the
-/// infinite canvas based on the current camera state.
-///
-/// Formula: screen = (logical * zoom) + pan + viewport_origin
-pub fn to_screen_pt(
+/// Converts logical canvas coordinates to LOCAL panel-space points.
+/// Use this for positioning nodes (divs) inside the panel.
+pub fn to_local_screen_pt(logical: Point<f32>, zoom: f32, pan: Point<f32>) -> Point<Pixels> {
+    Point {
+        x: px(logical.x * zoom + pan.x),
+        y: px(logical.y * zoom + pan.y),
+    }
+}
+
+/// Converts logical canvas coordinates to GLOBAL window-space points.
+/// Use this for painting directly to the window (e.g. paths in the canvas).
+pub fn to_global_screen_pt(
     logical: Point<f32>,
     viewport_origin: Point<Pixels>,
     zoom: f32,
     pan: Point<f32>,
 ) -> Point<Pixels> {
-    // In GPUI, Pixels can typically be converted to f32 via `.into()`
-    let origin_x: f32 = viewport_origin.x.into();
-    let origin_y: f32 = viewport_origin.y.into();
-
+    let local = to_local_screen_pt(logical, zoom, pan);
     Point {
-        x: px(logical.x * zoom + pan.x + origin_x),
-        y: px(logical.y * zoom + pan.y + origin_y),
+        x: local.x + viewport_origin.x,
+        y: local.y + viewport_origin.y,
     }
 }
 
-/// Converts a screen-space point (from a mouse event) to a logical canvas coordinate.
-///
-/// This is used to map where the user clicked on the monitor to the corresponding
-/// coordinate in the physics engine.
-///
-/// Formula: logical = (screen - viewport_origin - pan) / zoom
 pub fn to_logical_pt(
     screen: Point<Pixels>,
     viewport_origin: Point<Pixels>,
@@ -45,16 +41,13 @@ pub fn to_logical_pt(
     }
 }
 
-/// Calculates the visible bounds of the canvas in logical coordinates.
-///
-/// Useful for viewport culling: avoiding rendering nodes/edges that are
-/// currently panned or zoomed out of view.
 pub fn visible_logical_bounds(
     viewport_origin: Point<Pixels>,
-    viewport_size: gpui::Size<Pixels>,
+    viewport_size: Size<Pixels>,
     zoom: f32,
     pan: Point<f32>,
-) -> gpui::Bounds<f32> {
+) -> Bounds<f32> {
+    // The top-left logical point is simply the window origin mapped to logical space
     let top_left = to_logical_pt(viewport_origin, viewport_origin, zoom, pan);
 
     let bottom_right_screen = Point {
@@ -64,9 +57,9 @@ pub fn visible_logical_bounds(
 
     let bottom_right = to_logical_pt(bottom_right_screen, viewport_origin, zoom, pan);
 
-    gpui::Bounds {
+    Bounds {
         origin: top_left,
-        size: gpui::Size {
+        size: Size {
             width: bottom_right.x - top_left.x,
             height: bottom_right.y - top_left.y,
         },
