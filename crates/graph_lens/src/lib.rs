@@ -1,7 +1,10 @@
+// src/lib.rs
+
 use editor::Editor;
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyContext, ParentElement, Render, Styled, Subscription, Task,
+    AnyElement, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ParentElement, Pixels, Point, Render, ScrollWheelEvent, Size, Styled, Subscription, Task,
     UniformListScrollHandle, Window, actions, div, px, uniform_list,
 };
 use language::{Anchor, BufferId, OutlineItem};
@@ -11,7 +14,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use theme;
+use theme::ActiveTheme;
 use ui::{Color, Icon, IconName, Label, prelude::*};
 use util::{ResultExt, rel_path::RelPath};
 use workspace::{
@@ -19,7 +22,15 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
     item::ItemHandle,
 };
-use worktree::Snapshot;
+
+mod canvas_utils;
+mod constants;
+mod graph_engine;
+mod layout_fruchterman_reingold;
+mod quadtree;
+
+use canvas_utils::{to_logical_pt, to_screen_pt, visible_logical_bounds};
+use constants::*;
 
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
 const GRAPH_LENS_PANEL_KEY: &str = "graph_lens_panel";
@@ -135,7 +146,6 @@ impl TreeBuilder {
                                 stack.push((child, depth + 1));
                             }
                         } else if is_open {
-                            // Inject outline elements
                             if let Some(outlines) = open_outlines.get(&entry.id) {
                                 for outline in outlines {
                                     let symbol_name = SharedString::from(outline.text.clone());
@@ -200,6 +210,17 @@ struct State {
     expanded_files: HashSet<(WorktreeId, ProjectEntryId)>,
     selected_index: Option<usize>,
     active_tab: ActiveTab,
+    graph_engine: graph_engine::GraphEngine,
+
+    // Camera and Interaction State
+    zoom: f32,
+    pan: Point<f32>,
+    viewport_origin: Point<Pixels>,
+    viewport_size: Size<Pixels>,
+    is_panning: bool,
+    pan_last_pos: Option<Point<f32>>,
+    dragging_node: Option<graph_engine::NodeId>,
+    drag_offset: Option<Point<f32>>,
 }
 
 pub fn init(cx: &mut App) {
@@ -213,67 +234,6 @@ pub fn init(cx: &mut App) {
                 if !workspace.toggle_panel_focus::<GraphLensPanel>(window, cx) {
                     workspace.close_panel::<GraphLensPanel>(window, cx);
                 }
-            });
-
-            workspace.register_action(|workspace, action: &CollapseAllEntries, window, cx| {
-                if let Some(panel) = workspace.panel::<GraphLensPanel>(cx) {
-                    panel.update(cx, |panel, cx| {
-                        panel.collapse_all_entries(action, window, cx);
-                    });
-                }
-            });
-
-            workspace.register_action(|workspace, action: &Rename, window, cx| {
-                workspace.open_panel::<GraphLensPanel>(window, cx);
-                if let Some(panel) = workspace.panel::<GraphLensPanel>(cx) {
-                    panel.update(cx, |panel, cx| {
-                        if let Some(first_marked) = panel.state.selected_index {
-                            panel.state.selected_index = Some(first_marked);
-                        }
-                        panel.rename(action, window, cx);
-                    });
-                }
-            });
-
-            workspace.register_action(|workspace, action: &Duplicate, window, cx| {
-                workspace.open_panel::<GraphLensPanel>(window, cx);
-                if let Some(panel) = workspace.panel::<GraphLensPanel>(cx) {
-                    panel.update(cx, |panel, cx| {
-                        panel.duplicate(action, window, cx);
-                    });
-                }
-            });
-
-            workspace.register_action(|workspace, action: &Delete, window, cx| {
-                if let Some(panel) = workspace.panel::<GraphLensPanel>(cx) {
-                    panel.update(cx, |panel, cx| panel.delete(action, window, cx));
-                }
-            });
-
-            workspace.register_action(|workspace, _: &ToggleHideGitIgnore, _, cx| {
-                let fs = workspace.app_state().fs.clone();
-                settings::update_settings_file(fs, cx, move |setting, _| {
-                    setting.project_panel.get_or_insert_default().hide_gitignore = Some(
-                        !setting
-                            .project_panel
-                            .get_or_insert_default()
-                            .hide_gitignore
-                            .unwrap_or(false),
-                    );
-                })
-            });
-
-            workspace.register_action(|workspace, _: &ToggleHideHidden, _, cx| {
-                let fs = workspace.app_state().fs.clone();
-                settings::update_settings_file(fs, cx, move |setting, _| {
-                    setting.project_panel.get_or_insert_default().hide_hidden = Some(
-                        !setting
-                            .project_panel
-                            .get_or_insert_default()
-                            .hide_hidden
-                            .unwrap_or(false),
-                    );
-                })
             });
 
             if let Some(window) = window {
@@ -357,33 +317,36 @@ impl GraphLensPanel {
                         lens_panel.update_entries(Some(UPDATE_DEBOUNCE), window, cx);
                         cx.notify();
                     }
-                    project::Event::ExpandedAllForEntry(worktree_id, entry_id) => {
-                        lens_panel.expand_all_for_entry(*worktree_id, *entry_id, cx);
-                        lens_panel.update_entries(None, window, cx);
-                        cx.notify();
-                    }
                     _ => {}
                 },
             );
 
-            let icons_subscription = cx.observe_global::<file_icons::FileIcons>(|_, cx| {
-                cx.notify();
-            });
-
             let mut lens_panel = Self {
-                project: project.clone(),
+                project,
                 workspace: workspace_handle,
                 outline_provider: None,
                 focus_handle,
                 scroll_handle: UniformListScrollHandle::new(),
 
                 state: State {
-                    project_name: SharedString::new("Project Not Found"),
+                    project_name: SharedString::new("Loading..."),
                     entries: Vec::new(),
                     expanded_dirs: HashSet::new(),
                     expanded_files: HashSet::new(),
                     selected_index: None,
-                    active_tab: ActiveTab::List,
+                    active_tab: ActiveTab::Graph,
+                    graph_engine: graph_engine::GraphEngine::new(800.0, 600.0),
+                    zoom: 1.0,
+                    pan: Point::default(),
+                    viewport_origin: Point::default(),
+                    viewport_size: Size {
+                        width: px(800.0),
+                        height: px(600.0),
+                    },
+                    is_panning: false,
+                    pan_last_pos: None,
+                    dragging_node: None,
+                    drag_offset: None,
                 },
 
                 update_task: None,
@@ -391,23 +354,70 @@ impl GraphLensPanel {
                     focus_subscription,
                     workspace_subscription,
                     project_subscription,
-                    icons_subscription,
                 ],
             };
 
             lens_panel.update_entries(None, window, cx);
-
-            if let Some((item, editor)) = workspace_active_editor(workspace, cx) {
-                lens_panel.replace_active_editor(item, editor, window, cx);
-            }
-
             lens_panel
         })
     }
 
-    fn set_tab(&mut self, tab: ActiveTab, _window: &mut Window, cx: &mut Context<Self>) {
+    fn sync_graph_engine(&mut self) {
+        let bounds_x = self.state.graph_engine.bounds.x;
+        let bounds_y = self.state.graph_engine.bounds.y;
+
+        let old_engine = std::mem::replace(
+            &mut self.state.graph_engine,
+            graph_engine::GraphEngine::new(bounds_x, bounds_y),
+        );
+
+        let mut parent_stack = Vec::new();
+
+        for entry in &self.state.entries {
+            while parent_stack.len() > entry.depth {
+                parent_stack.pop();
+            }
+
+            let parent_id = parent_stack.last().copied();
+
+            let kind = match entry.kind {
+                LensEntryKind::Dir => graph_engine::NodeKind::Directory,
+                LensEntryKind::File => graph_engine::NodeKind::File,
+                LensEntryKind::Outline(_) => graph_engine::NodeKind::Outline,
+            };
+
+            let node_id = self
+                .state
+                .graph_engine
+                .add_node(entry.name.to_string(), kind, parent_id);
+
+            // Restore position, velocity, and size if it existed
+            if let Some(old_node) = old_engine
+                .nodes
+                .iter()
+                .find(|n| n.label == entry.name.to_string())
+            {
+                let node = &mut self.state.graph_engine.nodes[node_id.0];
+                node.position = old_node.position;
+                node.velocity = old_node.velocity;
+                node.size = old_node.size;
+            }
+
+            if let Some(pid) = parent_id {
+                self.state.graph_engine.add_edge(pid, node_id);
+            }
+
+            parent_stack.push(node_id);
+        }
+    }
+
+    fn set_tab(&mut self, tab: ActiveTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.active_tab != tab {
             self.state.active_tab = tab;
+            if tab == ActiveTab::Graph {
+                // Re-trigger layout so nodes move to their calculated positions
+                self.run_layout(window, cx);
+            }
             cx.notify();
         }
     }
@@ -416,45 +426,20 @@ impl GraphLensPanel {
         &mut self,
         _item: Box<dyn ItemHandle>,
         editor: Entity<Editor>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.outline_provider = Some(Arc::new(EditorOutlineProvider {
             editor: editor.downgrade(),
         }));
-        self.update_entries(Some(UPDATE_DEBOUNCE), _window, cx);
+        self.update_entries(Some(UPDATE_DEBOUNCE), window, cx);
     }
 
-    fn clear_active_editor(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn clear_active_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.outline_provider = None;
         self.state.expanded_files.clear();
-        self.update_entries(None, _window, cx);
-    }
-
-    fn expand_all_for_entry(
-        &mut self,
-        _worktree_id: WorktreeId,
-        _entry_id: ProjectEntryId,
-        _cx: &mut Context<Self>,
-    ) {
-        // TODO: Implementation for deep tree expansion goes here
-    }
-
-    pub fn collapse_all_entries(
-        &mut self,
-        _: &CollapseAllEntries,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.state.expanded_dirs.clear();
-        self.state.expanded_files.clear();
         self.update_entries(None, window, cx);
-        cx.notify();
     }
-
-    pub fn rename(&mut self, _: &Rename, _window: &mut Window, _cx: &mut Context<Self>) {}
-    pub fn duplicate(&mut self, _: &Duplicate, _window: &mut Window, _cx: &mut Context<Self>) {}
-    pub fn delete(&mut self, _: &Delete, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     fn update_entries(
         &mut self,
@@ -498,8 +483,7 @@ impl GraphLensPanel {
                 cx.background_executor().timer(duration).await;
             }
 
-            let mut open_outlines: HashMap<ProjectEntryId, Vec<OutlineItem<Anchor>>> =
-                HashMap::new();
+            let mut open_outlines = HashMap::new();
             for (entry_id, task) in outline_tasks {
                 open_outlines.insert(entry_id, task.await);
             }
@@ -525,6 +509,7 @@ impl GraphLensPanel {
                     this.state.selected_index =
                         Some(idx.min(this.state.entries.len().saturating_sub(1)));
                 }
+                this.sync_graph_engine();
                 cx.notify();
             })
             .log_err();
@@ -565,34 +550,22 @@ impl GraphLensPanel {
                 }
             }
             LensEntryKind::File => {
-                if entry.is_open {
-                    if entry.is_expanded {
-                        self.state
-                            .expanded_files
-                            .remove(&(entry.worktree_id, entry_id));
-                    } else {
-                        self.state
-                            .expanded_files
-                            .insert((entry.worktree_id, entry_id));
-                    }
-                } else {
-                    if let Some(workspace) = self.workspace.upgrade() {
-                        workspace.update(cx, |ws, cx| {
-                            ws.open_path_preview(
-                                ProjectPath {
-                                    worktree_id: entry.worktree_id,
-                                    path: entry.path.clone(),
-                                },
-                                None,
-                                true,
-                                false,
-                                true,
-                                window,
-                                cx,
-                            )
-                            .detach_and_log_err(cx);
-                        });
-                    }
+                if let Some(workspace) = self.workspace.upgrade() {
+                    workspace.update(cx, |ws, cx| {
+                        ws.open_path_preview(
+                            ProjectPath {
+                                worktree_id: entry.worktree_id,
+                                path: entry.path.clone(),
+                            },
+                            None,
+                            true,
+                            false,
+                            true,
+                            window,
+                            cx,
+                        )
+                        .detach_and_log_err(cx);
+                    });
                 }
             }
             LensEntryKind::Outline(_) => return,
@@ -629,14 +602,33 @@ impl GraphLensPanel {
         cx.notify();
     }
 
-    fn dispatch_context(&self, window: &Window, _cx: &Context<Self>) -> KeyContext {
-        let mut dispatch_context = KeyContext::new_with_defaults();
-        dispatch_context.add("GraphLensPanel");
-        dispatch_context.add("menu");
-        if self.focus_handle.is_focused(window) {
-            dispatch_context.add("GraphLensPanelFocused");
-        }
-        dispatch_context
+    fn run_layout(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let bounds = self.state.graph_engine.bounds;
+        let node_count = self.state.graph_engine.active_nodes.len();
+
+        let mut simulator =
+            layout_fruchterman_reingold::FruchtermanReingold::new(node_count, bounds.x, bounds.y);
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                if simulator.temp < MIN_TEMPERATURE {
+                    break;
+                }
+
+                let is_alive = this.update(cx, |this, cx| {
+                    simulator.update(&mut this.state.graph_engine);
+                    cx.notify();
+                });
+
+                if is_alive.is_err() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(SIMULATION_POLL_INTERVAL_MS))
+                    .await;
+            }
+        })
+        .detach();
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -698,14 +690,12 @@ impl GraphLensPanel {
         uniform_list(
             "graph_lens_entries",
             self.state.entries.len(),
-            // RESTORED: cx.processor wrapper and the 4-argument signature
             cx.processor(move |this, range, _window, cx| {
                 let mut items = Vec::new();
                 for ix in range {
                     let Some(entry) = this.state.entries.get(ix) else {
                         continue;
                     };
-
                     let is_selected = this.state.selected_index == Some(ix);
                     let indent = px((entry.depth * 16) as f32);
 
@@ -755,17 +745,261 @@ impl GraphLensPanel {
     }
 
     fn render_graph_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let zoom = self.state.zoom;
+        let pan = self.state.pan;
+        let viewport_origin = self.state.viewport_origin;
+        // Fix: Access viewport_size from the state struct
+        let viewport_size = self.state.viewport_size;
+
+        let mut viewport_bounds = visible_logical_bounds(viewport_origin, viewport_size, zoom, pan);
+        // Expand bounds slightly to prevent aggressive culling at the edges
+        viewport_bounds.origin.x -= 100.0;
+        viewport_bounds.origin.y -= 100.0;
+        viewport_bounds.size.width += 200.0;
+        viewport_bounds.size.height += 200.0;
+
+        // Clones for the main scope
+        let active_nodes = self.state.graph_engine.active_nodes.clone();
+        let edges = self.state.graph_engine.edges.clone();
+        let nodes = self.state.graph_engine.nodes.clone();
+        let entries = self.state.entries.clone();
+
+        let view_handle = cx.entity().clone();
+
+        // Secondary clones specifically for the move closure inside gpui::canvas
+        let canvas_active_nodes = active_nodes.clone();
+        let canvas_edges = edges.clone();
+        let canvas_nodes = nodes.clone();
+
+        let mut canvas_area = div()
+            .id("canvas-area")
+            .size_full()
+            .absolute()
+            .top_0()
+            .left_0()
+            .overflow_hidden()
+            .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
+                let delta = event.delta.pixel_delta(px(1.0)).y;
+                let zoom_speed = 0.001;
+                let old_zoom = this.state.zoom;
+
+                let delta_f32: f32 = delta.into();
+                this.state.zoom *= 1.0 + (delta_f32 * zoom_speed);
+                this.state.zoom = this.state.zoom.clamp(0.1, 5.0);
+
+                let logical_mouse = to_logical_pt(
+                    event.position,
+                    this.state.viewport_origin,
+                    old_zoom,
+                    this.state.pan,
+                );
+                this.state.pan.x -= logical_mouse.x * (this.state.zoom - old_zoom);
+                this.state.pan.y -= logical_mouse.y * (this.state.zoom - old_zoom);
+
+                cx.notify();
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                    this.state.is_panning = true;
+
+                    this.state.pan_last_pos = Some(Point {
+                        x: event.position.x.into(),
+                        y: event.position.y.into(),
+                    });
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                if this.state.is_panning {
+                    if let Some(last_pos) = this.state.pan_last_pos {
+                        let current_x: f32 = event.position.x.into();
+                        let current_y: f32 = event.position.y.into();
+                        this.state.pan.x += current_x - last_pos.x;
+                        this.state.pan.y += current_y - last_pos.y;
+                        this.state.pan_last_pos = Some(Point {
+                            x: current_x,
+                            y: current_y,
+                        });
+                        cx.notify();
+                    }
+                } else if let Some(offset) = this.state.drag_offset {
+                    if let Some(id) = this.state.dragging_node {
+                        let logical_pt = to_logical_pt(
+                            event.position,
+                            this.state.viewport_origin,
+                            this.state.zoom,
+                            this.state.pan,
+                        );
+                        let node = &mut this.state.graph_engine.nodes[id.0];
+                        node.position.x = logical_pt.x - offset.x;
+                        node.position.y = logical_pt.y - offset.y;
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if let Some(id) = this.state.dragging_node {
+                        this.state.graph_engine.nodes[id.0].is_fixed = false;
+                    }
+                    this.state.dragging_node = None;
+                    this.state.drag_offset = None;
+                    this.state.is_panning = false;
+                    this.state.pan_last_pos = None;
+                    cx.notify();
+                }),
+            );
+
+        // Render Edges via Canvas
+        canvas_area = canvas_area.child(
+            gpui::canvas(
+                move |bounds, _, _| bounds,
+                move |bounds, _bounds_data, window, cx| {
+                    let view_handle = view_handle.clone();
+                    let new_origin = bounds.origin;
+                    let new_size = bounds.size;
+
+                    window.on_next_frame(move |_window, cx| {
+                        // Fix: Added _window and cx arguments
+                        view_handle.update(cx, |this, cx| {
+                            if this.state.viewport_origin != new_origin
+                                || this.state.viewport_size != new_size
+                            {
+                                this.state.viewport_origin = new_origin;
+                                this.state.viewport_size = new_size;
+                                cx.notify();
+                            }
+                        });
+                    });
+
+                    for edge in &canvas_edges {
+                        if canvas_active_nodes.contains(&edge.source)
+                            && canvas_active_nodes.contains(&edge.target)
+                        {
+                            let n1 = &canvas_nodes[edge.source.0];
+                            let n2 = &canvas_nodes[edge.target.0];
+
+                            let center1 = Point {
+                                x: n1.position.x + n1.size.width / 2.0,
+                                y: n1.position.y + n1.size.height / 2.0,
+                            };
+                            let center2 = Point {
+                                x: n2.position.x + n2.size.width / 2.0,
+                                y: n2.position.y + n2.size.height / 2.0,
+                            };
+
+                            let screen1 = to_screen_pt(center1, bounds.origin, zoom, pan);
+                            let screen2 = to_screen_pt(center2, bounds.origin, zoom, pan);
+
+                            let mut path = gpui::Path::new(screen1);
+                            path.line_to(screen2);
+                            window.paint_path(path, gpui::rgba(0x66666666));
+                        }
+                    }
+                },
+            )
+            .absolute()
+            .size_full(),
+        );
+
+        // Render Nodes as absolute elements (divs)
+        for &node_id in &active_nodes {
+            let node = &nodes[node_id.0];
+
+            let node_bounds = Bounds {
+                origin: node.position,
+                size: node.size,
+            };
+
+            if viewport_bounds.intersects(&node_bounds) {
+                let screen_pt = to_screen_pt(node.position, viewport_origin, zoom, pan);
+                let screen_w = px(node.size.width * zoom);
+                let screen_h = px(node.size.height * zoom);
+
+                let entry_index = entries
+                    .iter()
+                    .position(|e| e.name.to_string() == node.label);
+                let is_selected = entry_index.is_some() && self.state.selected_index == entry_index;
+
+                let (bg_color, border_color): (gpui::Hsla, gpui::Hsla) = match node.kind {
+                    graph_engine::NodeKind::Directory | graph_engine::NodeKind::Worktree => {
+                        (gpui::rgba(0x4CAF5022).into(), gpui::rgba(0x4CAF50FF).into())
+                    }
+                    graph_engine::NodeKind::File => (
+                        cx.theme().colors().element_background,
+                        gpui::rgba(0x2196F3FF).into(),
+                    ),
+                    _ => (
+                        cx.theme().colors().element_background,
+                        gpui::rgba(0xFFC107FF).into(),
+                    ),
+                };
+
+                let element = div()
+                    .absolute()
+                    .left(screen_pt.x)
+                    .top(screen_pt.y)
+                    .w(screen_w)
+                    .h(screen_h)
+                    .bg(bg_color)
+                    .border(px(1.0 * zoom.max(0.5)))
+                    .border_color(if is_selected {
+                        cx.theme().colors().text_accent
+                    } else {
+                        border_color
+                    })
+                    .rounded(px(4.0 * zoom))
+                    .p(px(4.0 * zoom))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener({
+                            let n_id = node_id;
+                            let e_idx = entry_index;
+                            move |this, event: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+
+                                if let Some(idx) = e_idx {
+                                    this.state.selected_index = Some(idx);
+                                    this.toggle_expanded_state(&ToggleExpanded, window, cx);
+                                }
+
+                                this.state.dragging_node = Some(n_id);
+                                this.state.graph_engine.nodes[n_id.0].is_fixed = true;
+
+                                let logical_pt = to_logical_pt(
+                                    event.position,
+                                    this.state.viewport_origin,
+                                    this.state.zoom,
+                                    this.state.pan,
+                                );
+                                let node_pos = this.state.graph_engine.nodes[n_id.0].position;
+
+                                this.state.drag_offset = Some(Point {
+                                    x: logical_pt.x - node_pos.x,
+                                    y: logical_pt.y - node_pos.y,
+                                });
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .child(Label::new(node.label.clone()).single_line());
+
+                canvas_area = canvas_area.child(element);
+            }
+        }
+
+        // Main Layout Container
         div()
             .flex_1()
             .size_full()
             .flex()
             .flex_col()
-            .child(div().flex_1().size_full().child(gpui::canvas(
-                |_bounds, _window, _cx| (),
-                |_state, _bounds, _window, _cx| {
-                    // TODO: Implement GPUI Canvas drawing logic here
-                },
-            )))
+            .child(div().flex_1().size_full().child(canvas_area))
             .child(
                 div()
                     .w_full()
@@ -783,9 +1017,36 @@ impl GraphLensPanel {
                             .flex()
                             .flex_row()
                             .gap_2()
-                            .child(self.render_graph_button("btn-zoom-in", "Zoom In", cx))
-                            .child(self.render_graph_button("btn-zoom-out", "Zoom Out", cx))
-                            .child(self.render_graph_button("btn-zoom-fit", "Zoom to Fit", cx)),
+                            .child(
+                                div()
+                                    .id("btn-zoom-in")
+                                    .cursor_pointer()
+                                    .px_2()
+                                    .py_1()
+                                    .bg(cx.theme().colors().element_background)
+                                    .hover(|s| s.opacity(0.8))
+                                    .rounded_md()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.zoom *= 1.1;
+                                        cx.notify();
+                                    }))
+                                    .child(Label::new("Zoom In")),
+                            )
+                            .child(
+                                div()
+                                    .id("btn-zoom-out")
+                                    .cursor_pointer()
+                                    .px_2()
+                                    .py_1()
+                                    .bg(cx.theme().colors().element_background)
+                                    .hover(|s| s.opacity(0.8))
+                                    .rounded_md()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.zoom *= 0.9;
+                                        cx.notify();
+                                    }))
+                                    .child(Label::new("Zoom Out")),
+                            ),
                     )
                     .child(
                         div()
@@ -796,28 +1057,12 @@ impl GraphLensPanel {
                             .bg(cx.theme().colors().element_background)
                             .hover(|s| s.opacity(0.8))
                             .rounded_md()
-                            .on_click(cx.listener(|_, _, _, _| println!("Run Layout clicked")))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.run_layout(window, cx)),
+                            )
                             .child(Label::new("Run Layout")),
                     ),
             )
-    }
-
-    fn render_graph_button(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .id(id)
-            .cursor_pointer()
-            .px_2()
-            .py_1()
-            .bg(cx.theme().colors().element_background)
-            .hover(|s| s.opacity(0.8))
-            .rounded_md()
-            .on_click(cx.listener(move |_, _, _, _| println!("{} clicked", label)))
-            .child(Label::new(label))
     }
 }
 
@@ -833,13 +1078,20 @@ impl Render for GraphLensPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_focused = self.focus_handle.is_focused(window);
 
+        let mut dispatch_context = KeyContext::new_with_defaults();
+        dispatch_context.add("GraphLensPanel");
+        dispatch_context.add("menu");
+        if is_focused {
+            dispatch_context.add("GraphLensPanelFocused");
+        }
+
         div()
             .id("graph-lens-panel")
             .track_focus(&self.focus_handle)
             .size_full()
             .flex()
             .flex_col()
-            .key_context(self.dispatch_context(window, cx))
+            .key_context(dispatch_context)
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::toggle_expanded_state))
@@ -874,15 +1126,12 @@ impl Panel for GraphLensPanel {
     fn toggle_action(&self) -> Box<dyn gpui::Action> {
         Box::new(ToggleFocus)
     }
-
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
         Some(IconName::ListTree)
     }
-
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
         Some("Graph Lens")
     }
-
     fn set_position(
         &mut self,
         _position: DockPosition,
