@@ -1,9 +1,16 @@
 [package]
 name = "graph_lens"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 gpui = { path = "../gpui" }
 ui = { path = "../ui" }
 workspace = { path = "../workspace" }
+project = { path = "../project" }
+language = { path = "../language" }
+editor = { path = "../editor" }
+util = { path = "../util" }
+settings = { path = "../settings" }
+file_icons = { path = "../file_icons"}
+theme = { path = "../theme" }
