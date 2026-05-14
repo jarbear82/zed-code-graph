@@ -1,11 +1,9 @@
-// src/lib.rs
-
 use editor::Editor;
 use gpui::{
     AnyElement, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseMoveEvent,
     ParentElement, Pixels, Point, Render, ScrollWheelEvent, Size, Styled, Subscription, Task,
-    UniformListScrollHandle, Window, actions, div, px, uniform_list,
+    TextSystem, UniformListScrollHandle, Window, actions, div, px, uniform_list,
 };
 use language::{Anchor, BufferId, OutlineItem};
 use project::{File, Project, ProjectEntryId, ProjectPath, WorktreeId};
@@ -364,7 +362,7 @@ impl GraphLensPanel {
         })
     }
 
-    fn sync_graph_engine(&mut self) {
+    fn sync_graph_engine(&mut self, _cx: &mut Context<Self>) {
         let bounds_x = self.state.graph_engine.bounds.x;
         let bounds_y = self.state.graph_engine.bounds.y;
 
@@ -388,10 +386,31 @@ impl GraphLensPanel {
                 LensEntryKind::Outline(_) => graph_engine::NodeKind::Outline,
             };
 
+            // --- NEW: Calculate text-based size ---
+            let label_str = entry.name.to_string();
+
+            // Approximate width based on character count
+            let measured_width: f32 = label_str.len() as f32 * 8.0;
+
+            // Add horizontal padding (e.g., 16px on each side)
+            let node_width = (measured_width + 32.0).max(160.0);
+            let node_height = 40.0; // Standard height for files/outline items
+
+            let custom_size = if kind == graph_engine::NodeKind::File
+                || kind == graph_engine::NodeKind::Outline
+            {
+                Some(Size {
+                    width: node_width,
+                    height: node_height,
+                })
+            } else {
+                None // Use defaults for Directories (which are resized by physics anyway)
+            };
+
             let node_id = self
                 .state
                 .graph_engine
-                .add_node(entry.name.to_string(), kind, parent_id);
+                .add_node(label_str, kind, parent_id, custom_size);
 
             // Restore position, velocity, and size if it existed
             if let Some(old_node) = old_engine
@@ -511,7 +530,7 @@ impl GraphLensPanel {
                     this.state.selected_index =
                         Some(idx.min(this.state.entries.len().saturating_sub(1)));
                 }
-                this.sync_graph_engine();
+                this.sync_graph_engine(cx);
                 cx.notify();
             })
             .log_err();
@@ -750,7 +769,6 @@ impl GraphLensPanel {
         let zoom = self.state.zoom;
         let pan = self.state.pan;
         let viewport_origin = self.state.viewport_origin;
-        // Fix: Access viewport_size from the state struct
         let viewport_size = self.state.viewport_size;
 
         let mut viewport_bounds = visible_logical_bounds(viewport_origin, viewport_size, zoom, pan);
@@ -940,6 +958,9 @@ impl GraphLensPanel {
                     ),
                 };
 
+                // 1. Calculate a scaled font size
+                let scaled_font_size = rems(1.0 * zoom);
+
                 let element = div()
                     .absolute()
                     .left(screen_pt.x)
@@ -989,8 +1010,11 @@ impl GraphLensPanel {
                             }
                         }),
                     )
-                    .child(Label::new(node.label.clone()).single_line());
-
+                    .child(
+                        Label::new(node.label.clone())
+                            .single_line()
+                            .size(LabelSize::Custom(scaled_font_size)), // Apply the scaled font size here
+                    );
                 canvas_area = canvas_area.child(element);
             }
         }

@@ -1,5 +1,3 @@
-// src/graph_engine.rs
-
 use gpui::{Point, Size};
 use std::collections::HashSet;
 
@@ -70,12 +68,17 @@ impl GraphEngine {
         }
     }
 
-    pub fn add_node(&mut self, label: String, kind: NodeKind, parent: Option<NodeId>) -> NodeId {
+    pub fn add_node(
+        &mut self,
+        label: String,
+        kind: NodeKind,
+        parent: Option<NodeId>,
+        size: Option<Size<f32>>,
+    ) -> NodeId {
         let id = NodeId(self.nodes.len());
 
-        // NEW: Assign a default starting size based on the node kind.
-        // The layout engine will dynamically expand directories later to fit their children.
-        let initial_size = match kind {
+        // Use the provided size or fallback to defaults
+        let initial_size = size.unwrap_or_else(|| match kind {
             NodeKind::Worktree | NodeKind::Directory => Size {
                 width: 200.0,
                 height: 100.0,
@@ -84,20 +87,20 @@ impl GraphEngine {
                 width: 160.0,
                 height: 40.0,
             },
-        };
+        });
 
         let mut node = GraphNode {
             id,
             kind,
             label,
             parent,
+            size: initial_size,
             children: Vec::new(),
             expanded: true,
             position: Point {
                 x: (rand::random::<f32>() - 0.5) * 100.0 + (self.bounds.x / 2.0),
                 y: (rand::random::<f32>() - 0.5) * 100.0 + (self.bounds.y / 2.0),
             },
-            size: initial_size,
             velocity: Point::default(),
             mass: 1.0,
             external_force: Point::default(),
